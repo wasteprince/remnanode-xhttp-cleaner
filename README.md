@@ -1,44 +1,42 @@
 <div align="center">
 
-# 🧹 RemnaNode XHTTP Cleaner
+# 🧬 RemnaNode XHTTP Cleaner
 
-### Безопасная очистка старых TCP-сокетов и связанных XHTTP-буферов `rw-core`
+### Версионно-адаптивный форк Xray с внутренней очисткой старых XHTTP-буферов
 
-[![Version](https://img.shields.io/badge/version-2.2.0-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-supported-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](#requirements)
-[![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)](#requirements)
+[![Version](https://img.shields.io/badge/version-3.0.0-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-supported-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](#-требования)
+[![Xray](https://img.shields.io/badge/Xray-version--matched-1686F0?style=for-the-badge)](#-как-работает-обновление)
 [![License](https://img.shields.io/github/license/wasteprince/remnanode-xhttp-cleaner?style=for-the-badge&color=22c55e)](LICENSE)
 
-**XHTTP Cleaner v2.2.0 · by Bankaev**
+**XHTTP Cleaner v3.0.0 · by Bankaev**
 
-[Быстрая установка](#quick-start) · [Как это работает](#how-it-works) · [Управление](#control) · [Конфигурация](#configuration) · [Ограничения](#limitations)
+[Установка](#-быстрая-установка) · [Принцип работы](#-как-это-работает) · [Управление](#-управление) · [Обновления](#-как-работает-обновление) · [Откат](#-откат)
 
 </div>
 
 ---
 
 > [!IMPORTANT]
-> Очиститель не изменяет Config Profile Xray, Docker Compose, лимиты памяти или параметры ядра и не перезапускает контейнер RemnaNode.
+> Версия 3.0.0 действительно изменяет Xray: собирает форк ровно от версии ядра, найденной в запущенном контейнере, атомарно заменяет `/usr/local/bin/xray` и перезапускает **тот же** контейнер. Контейнер не пересоздаётся, поэтому его env, mounts, ports, networks и restart policy сохраняются.
 
-## ✨ Возможности
+## ✨ Что делает программа
 
-| Возможность | Что делает |
+| Компонент | Назначение |
 |---|---|
-| 🧠 Очистка XHTTP | Находит неактивные TCP-соединения XHTTP/splithttp и освобождает связанные сетевые буферы |
-| 🛡️ Защита от race condition | Повторно проверяет inode, активность и 64-битный kernel socket cookie непосредственно перед закрытием |
-| 🎯 Точный выбор процесса | Работает только с сокетами текущего процесса `rw-core`/`xray` |
-| 🔍 Безопасный scan | Показывает кандидатов без каких-либо изменений |
-| 🐳 Работа с Docker | Выполняет socket-diag внутри network namespace контейнера, не меняя сам контейнер |
-| ⏱️ Автоматический запуск | Использует короткую systemd `oneshot`-службу и timer вместо постоянно работающего фонового процесса |
-| 🖥️ Панель управления | Устанавливает команду `xhttp-cleaner` со статусом, логами, тестами и управлением службой |
-| ♻️ Повторная установка | Сохраняет существующий конфигурационный файл при обновлении |
-
-<a id="quick-start"></a>
+| Внутренний XHTTP reaper | Работает непосредственно в `splithttp` Xray и закрывает сессии только после ≥ 5 минут без полезных данных |
+| Очистка очередей | Закрывает `uploadQueue`, освобождает ссылки на накопленные payload-буферы и вызывает отложенный `debug.FreeOSMemory()` |
+| Защита новой сессии | Использует `sync.Map.CompareAndDelete(sessionID, expectedSessionPointer)`: новый объект с тем же IP или session ID не удаляется |
+| Учёт двух направлений | Обновляет время активности при реальном upload payload/read и downstream write; служебный stream-up padding активностью не считается |
+| Compatibility gate | Перед установкой применяет структурный патч, запускает Go-тесты, отдельный race-тест и проверяет действующий RemnaNode-конфиг новым бинарником |
+| Автоматическое сопровождение | Каждые 5 минут проверяет ядро; после обновления RemnaNode собирает новый форк для новой версии |
+| Fail closed | Если структура новой версии Xray несовместима, новое штатное ядро остаётся нетронутым — старый форк поверх него не устанавливается |
+| Атомарный откат | Хранит оригинальный бинарник, Docker inspect и контрольные суммы; при неуспешном старте автоматически возвращает оригинал |
+| Внешняя страховка | Сохраняет очистку старых TCP-сокетов через `NETLINK_SOCK_DIAG` с inode + 64-битным kernel cookie |
 
 ## 🚀 Быстрая установка
 
-> [!NOTE]
-> Docker и контейнер RemnaNode должны быть установлены и запущены заранее.
+Docker и работающий контейнер RemnaNode должны быть установлены заранее.
 
 ```bash
 sudo apt update
@@ -52,37 +50,50 @@ sudo chmod +x install.sh
 sudo ./install.sh
 ```
 
-После установки сразу появится команда:
-
-```bash
-xhttp-cleaner
-```
-
-`install.sh` автоматически:
-
-1. проверит Ubuntu, Docker и файлы проекта;
-2. установит `python3`, `util-linux` и `ca-certificates`;
-3. найдёт запущенный контейнер RemnaNode;
-4. создаст конфигурацию, если она ещё отсутствует;
-5. установит программу и панель управления;
-6. создаст и включит systemd service/timer;
-7. сразу выполнит первую очистку.
-
-<details>
-<summary><strong>Если контейнер называется не remnanode</strong></summary>
-
-Установщик сам выберет контейнер, если запущен ровно один контейнер с образом `remnawave/node`. Имя также можно передать явно:
+Если контейнер называется не `remnanode`:
 
 ```bash
 cd /opt/node-xhttp
 sudo env REMNANODE_CONTAINER=my-remnanode ./install.sh
 ```
 
-Существующая конфигурация `/etc/remnanode-xhttp-clean.json` не перезаписывается. Если она уже создана, имя контейнера необходимо менять непосредственно в ней.
+Во время первой установки будет загружен Docker builder с нужной версией Go, собраны зависимости Xray, выполнены тесты и один раз перезапущен контейнер. Это может занять несколько минут. После завершения автоматически запускаются служба и команда управления:
 
-</details>
+```bash
+xhttp-cleaner
+```
 
-<a id="control"></a>
+## 🛡️ Как это работает
+
+```mermaid
+flowchart TD
+    A[Прочитать версию Xray из контейнера] --> B[Клонировать точный upstream tag]
+    B --> C[Наложить структурный XHTTP patch]
+    C --> D{Все anchors совпали ровно один раз?}
+    D -- Нет --> SAFE[Оставить текущее штатное ядро без изменений]
+    D -- Да --> E[Go tests + race tests + static build]
+    E --> F{Новый binary читает текущий RemnaNode config?}
+    F -- Нет --> SAFE
+    F -- Да --> G[Сохранить stock binary и Docker inspect]
+    G --> H[Атомарно заменить binary]
+    H --> I[Перезапустить тот же container]
+    I --> J{Container ID, settings, health и marker корректны?}
+    J -- Нет --> ROLLBACK[Автоматически вернуть stock binary]
+    J -- Да --> READY[Внутренний reaper активен]
+```
+
+### Логика внутренней очистки
+
+Для каждой серверной XHTTP-сессии форк хранит время последней полезной активности. Проверка выполняется каждые 5 минут. Сессия удаляется, только если одновременно верны условия:
+
+1. полезные данные не читались и не записывались не менее 300 секунд;
+2. в `sessions` по прежнему зарегистрирован именно тот же объект сессии;
+3. `CompareAndDelete` атомарно подтвердил и удалил этот объект;
+4. очередь относится к этой старой сессии, а не к новой сессии с таким же ID.
+
+После закрытия очереди обработчики завершаются, Go GC теряет ссылки на её payload slices, а вызов `debug.FreeOSMemory()` возвращает свободные страницы операционной системе. Вызов ограничен одним разом за пятиминутный интервал, чтобы не создавать постоянные stop-the-world паузы.
+
+Исходное правило Xray для незавершённой сессии без GET сохранено: такая сессия может быть закрыта через 30 секунд.
 
 ## 🎛️ Управление
 
@@ -92,121 +103,66 @@ sudo env REMNANODE_CONTAINER=my-remnanode ./install.sh
 xhttp-cleaner
 ```
 
-Панель показывает:
-
-- загрузку CPU, RAM и диска;
-- состояние systemd timer;
-- контейнер и образ RemnaNode;
-- RSS процесса Xray;
-- количество TCP-сокетов Xray;
-- старые outbound- и XHTTP-соединения;
-- обнаруженные XHTTP-listener’ы;
-- результат и время следующего запуска.
+Панель показывает состояние timer, версию и marker форка, контейнер RemnaNode, RSS Xray, сокеты и последние результаты.
 
 ### Команды
 
-| Команда | Назначение | Изменяет состояние |
-|---|---|:---:|
-| `xhttp-cleaner` | Открыть интерактивную панель | — |
-| `xhttp-cleaner status` | Показать состояние программы | Нет |
-| `xhttp-cleaner scan` | Показать старые соединения | Нет |
-| `xhttp-cleaner clean` | Выполнить повторную проверку и очистку | Да |
-| `xhttp-cleaner logs` | Показать последние 100 строк журнала | Нет |
-| `xhttp-cleaner logs --follow` | Следить за журналом в реальном времени | Нет |
-| `xhttp-cleaner enable` | Включить timer и сразу выполнить очистку | Да |
-| `xhttp-cleaner disable` | Отключить только очиститель и его timer | Да |
-| `xhttp-cleaner test` | Запустить тесты из `/opt/node-xhttp` | Нет |
-| `xhttp-cleaner reinstall` | Повторно запустить `/opt/node-xhttp/install.sh` | Да |
-| `xhttp-cleaner uninstall` | Удалить установленную программу после подтверждения | Да |
-| `xhttp-cleaner help` | Показать справку | Нет |
-
-Если команда запущена не от root, панель попробует перезапустить себя через `sudo`. Отключение очистителя не останавливает и не перезапускает RemnaNode.
-
-<a id="how-it-works"></a>
-
-## 🛡️ Как это работает
-
-Очиститель проверяет TCP-сокеты процесса `rw-core` в состояниях `ESTABLISHED` и `CLOSE-WAIT`.
-
-```mermaid
-flowchart TD
-    A[Получить TCP-сокеты через NETLINK_SOCK_DIAG] --> B{Сокет принадлежит rw-core?}
-    B -- Нет --> X[Пропустить]
-    B -- Да --> C{ESTABLISHED или CLOSE-WAIT?}
-    C -- Нет --> X
-    C -- Да --> D{Нет отправки и получения >= 300 сек?}
-    D -- Нет --> X
-    D -- Да --> E{Outbound или распознанный XHTTP?}
-    E -- Нет --> X
-    E -- Да --> F[Повторно запросить тот же sockid]
-    F --> G{inode, cookie и простой не изменились?}
-    G -- Нет --> X
-    G -- Да --> H[SOCK_DESTROY с исходным kernel cookie]
-```
-
-### Условия закрытия
-
-Сокет закрывается, только когда выполнены **все** условия:
-
-1. inode сокета принадлежит текущему процессу `rw-core`/`xray`;
-2. состояние сокета — `ESTABLISHED` или `CLOSE-WAIT`;
-3. с последней отправки и последнего получения данных прошло не менее `idle_seconds`;
-4. сокет является outbound-соединением либо принят распознанным XHTTP-listener’ом;
-5. loopback исключён для outbound и обычных inbound-соединений;
-6. непосредственно перед закрытием повторная проверка подтверждает прежнюю неактивность;
-7. inode и kernel socket cookie совпадают с первоначальным снимком.
-
-Для распознанного XHTTP-listener’а loopback разрешён, поскольку Xray часто находится за локальным reverse proxy.
-
-> [!TIP]
-> Новый сокет с тем же IP, локальным и удалённым портом не будет закрыт: новый socket object получает другой kernel cookie, поэтому финальный запрос больше не соответствует старому сокету.
-
-### Что программа намеренно не трогает
-
-- `TIME-WAIT` и `SYN-SENT`;
-- UDP-сокеты;
-- Unix-domain sockets;
-- сокеты других процессов;
-- активные соединения младше заданного порога;
-- обычные inbound-соединения при `include_inbound: false`;
-- loopback-трафик, не относящийся к распознанному XHTTP.
-
-## 🧩 Как обнаруживается XHTTP
-
-Перед каждым сканированием программа получает уже собранный активный конфиг из контейнера:
-
-```text
-cli --dump-config-raw
-```
-
-Для совместимости предусмотрен fallback на `cli -D`. Выбираются TCP-inbound’ы, у которых:
-
-```text
-streamSettings.network = xhttp | splithttp
-```
-
-Секретные данные из конфига не выводятся в журнал.
-
-| Статус | Значение |
+| Команда | Что делает |
 |---|---|
-| `ok` | Конфиг прочитан; список XHTTP-listener’ов успешно сформирован и может быть пустым |
-| `unavailable` | CLI или конфиг недоступен; XHTTP пропущен, но outbound-очистка продолжает работать |
-| `disabled` | Очистка XHTTP отключена параметром `clean_xhttp_buffers` |
+| `xhttp-cleaner status` | Панель состояния без изменений |
+| `xhttp-cleaner scan` | Показать старые TCP-сокеты без закрытия |
+| `xhttp-cleaner clean` | Немедленно повторно проверить и закрыть старые сокеты |
+| `xhttp-cleaner logs` | Последние 100 строк журнала |
+| `xhttp-cleaner logs --follow` | Следить за журналом |
+| `xhttp-cleaner enable` | Включить systemd timer и выполнить проверку |
+| `xhttp-cleaner disable` | Остановить автоматические проверки; установленный внутренний reaper остаётся в ядре до отката |
+| `xhttp-cleaner core-update` | Принудительно повторить compatibility gate, сборку и установку |
+| `xhttp-cleaner core-rollback` | Восстановить сохранённый оригинальный Xray |
+| `xhttp-cleaner test` | Запустить локальные тесты проекта |
+| `xhttp-cleaner reinstall` | Повторно запустить `/opt/node-xhttp/install.sh` |
+| `xhttp-cleaner uninstall` | Восстановить оригинальный Xray и удалить программу |
 
-> [!NOTE]
-> Значение `stale_xhttp_buffers` и строка «Старые XHTTP буф.» — это количество найденных старых XHTTP TCP-соединений, а не размер занятой памяти в байтах.
+Низкоуровневые команды:
 
-## 🧠 Что происходит с памятью
+```bash
+sudo /usr/local/lib/remnanode-xhttp-clean/xray-core-manager status
+sudo /usr/local/lib/remnanode-xhttp-clean/xray-core-manager ensure --retry-failed
+sudo /usr/local/lib/remnanode-xhttp-clean/xray-core-manager rollback
+```
 
-При `SOCK_DESTROY` ядро освобождает сетевые буферы закрытого сокета. Xray получает завершение соединения, после чего связанные обработчики и объекты могут быть освобождены сборщиком мусора Go.
+## 🔄 Как работает обновление
 
-Внешняя программа не имеет безопасного доступа к Go heap `rw-core`, поэтому она не удаляет произвольные внутренние XHTTP-очереди, у которых уже нет доступного TCP-сокета. RSS процесса также может уменьшиться не сразу: Go runtime способен оставить освобождённые страницы для повторного использования.
+Systemd timer запускается через 5 минут после загрузки и далее раз в 5 минут. Перед внешней очисткой сокетов `ExecStartPre` проверяет ядро.
 
-<a id="configuration"></a>
+- Если marker `xhttp-cleaner-v3` уже присутствует, сборка не запускается.
+- Если RemnaNode пересоздал контейнер с той же версией Xray, готовый проверенный artifact устанавливается повторно.
+- Если версия Xray изменилась, клонируется **ровно** tag `v<текущая-версия>`, после чего весь gate выполняется заново.
+- Если upstream изменил нужные структуры, patcher прекращает работу до первой записи, записывает причину и не повторяет тяжёлую сборку каждые 5 минут.
+- Для ручной повторной попытки после обновления самого Cleaner используется `core-update`.
+
+Невозможно честно гарантировать, что любой будущий Xray сохранит внутреннюю архитектуру. Поэтому совместимость обеспечивается не «слепым» применением старого patch-файла, а строгим правилом: новая версия либо полностью патчится, компилируется, тестируется и запускается, либо остаётся штатной.
+
+Обновление самого проекта:
+
+```bash
+cd /opt/node-xhttp
+sudo git pull
+sudo ./install.sh
+```
+
+## ↩ Откат
+
+```bash
+sudo xhttp-cleaner core-rollback
+```
+
+Откат проверяет checksum оригинального бинарника и ID контейнера, атомарно возвращает файл и перезапускает тот же контейнер. Если контейнер был пересоздан после последнего deploy, автоматический откат намеренно прекращается: старый бинарник нельзя безопасно переносить в неизвестную новую среду.
+
+При удалении Cleaner сначала обязан восстановить оригинальное ядро. Если безопасный откат невозможен, удаление прерывается и сохраняет backup/metadata для ручного восстановления.
 
 ## ⚙️ Конфигурация
 
-Путь: `/etc/remnanode-xhttp-clean.json`
+Файл `/etc/remnanode-xhttp-clean.json` относится к внешней socket-страховке:
 
 ```json
 {
@@ -218,142 +174,77 @@ streamSettings.network = xhttp | splithttp
 }
 ```
 
-| Параметр | По умолчанию | Описание |
-|---|---:|---|
-| `container` | `remnanode` | Имя Docker-контейнера RemnaNode |
-| `idle_seconds` | `300` | Минимальное время без отправки **и** получения данных; значение ниже 300 запрещено |
-| `clean_xhttp_buffers` | `true` | Обрабатывать распознанные XHTTP/splithttp TCP-соединения |
-| `include_inbound` | `false` | Разрешить обработку остальных TCP-inbound’ов на listening-портах Xray |
-| `exclude_loopback` | `true` | Исключить loopback для outbound и обычных inbound-соединений; для распознанного XHTTP не применяется |
+`idle_seconds` нельзя установить ниже 300. Внутренний reaper форка также имеет безопасный минимум 5 минут и не зависит от неточного определения TCP idle снаружи процесса.
 
-> [!WARNING]
-> Оставляйте `include_inbound` равным `false`, если вам не требуется намеренно закрывать другие неактивные inbound-соединения Xray.
-
-Если конфигурация от старой версии не содержит `clean_xhttp_buffers`, используется значение по умолчанию `true`. Файл читается при каждом запуске, поэтому после его изменения перезапуск timer не требуется.
-
-## ⏱️ Systemd
-
-Программа не занимает память 24/7 отдельным процессом. Timer запускает короткую службу типа `oneshot`:
-
-| Параметр | Значение |
-|---|---:|
-| `OnBootSec` | `5min` |
-| `OnUnitActiveSec` | `5min` |
-| `RandomizedDelaySec` | `20s` |
-| Service type | `oneshot` |
-| Nice | `10` |
-
-Во время установки первая очистка выполняется немедленно. После перезагрузки включённый timer снова запускается вместе с `timers.target`.
-
-Прямое управление:
-
-```bash
-sudo systemctl status remnanode-xhttp-clean.timer
-sudo systemctl start remnanode-xhttp-clean.service
-sudo journalctl -u remnanode-xhttp-clean.service -n 100
-```
-
-## 📁 Устанавливаемые файлы
+## 📁 Устанавливаемые данные
 
 | Путь | Назначение |
 |---|---|
-| `/usr/local/sbin/remnanode-xhttp-clean` | Основная программа |
-| `/usr/local/bin/xhttp-cleaner` | Панель и команда управления |
+| `/usr/local/sbin/remnanode-xhttp-clean` | Внешний socket cleaner |
+| `/usr/local/bin/xhttp-cleaner` | Панель управления |
+| `/usr/local/lib/remnanode-xhttp-clean/` | Core manager и version-gated patch assets |
 | `/etc/remnanode-xhttp-clean.json` | Конфигурация |
 | `/etc/systemd/system/remnanode-xhttp-clean.service` | One-shot служба |
-| `/etc/systemd/system/remnanode-xhttp-clean.timer` | Периодический запуск |
-| `/opt/node-xhttp` | Исходный репозиторий для обновления, тестов и переустановки |
+| `/etc/systemd/system/remnanode-xhttp-clean.timer` | Пятиминутный timer |
+| `/var/lib/remnanode-xhttp-clean/` | Stock binaries, checksums, deployment metadata и Docker inspect |
+| `/var/cache/remnanode-xhttp-clean/` | Собранные artifacts и Go cache |
 
-<a id="requirements"></a>
+> [!WARNING]
+> Docker inspect может содержать секретные env-переменные. Файлы состояния создаются с правами `0600`, каталоги backup — `0700`. Не публикуйте их.
+
+## 🧪 Тесты
+
+```bash
+cd /opt/node-xhttp
+python3 -m unittest -v \
+  tests/test_cleaner.py \
+  tests/test_core_manager.py \
+  tests/test_xray_patcher.py
+bash tests/test_install.sh
+```
+
+Во время реальной сборки дополнительно запускаются upstream-тесты `transport/internet/splithttp` и race-тесты новых функций. Затем собранный статический ELF проверяется на действующем конфиге внутри RemnaNode.
 
 ## 📋 Требования
 
 - Ubuntu с systemd;
+- root-доступ;
 - запущенный Docker и контейнер RemnaNode;
-- права root;
-- Python 3;
-- `nsenter` из `util-linux`;
-- Linux с поддержкой `NETLINK_SOCK_DIAG` и `SOCK_DESTROY`.
+- доступ к `github.com/XTLS/Xray-core` и Docker Hub во время новой сборки;
+- архитектура `amd64` или `arm64`;
+- свободное место для исходников, Go modules и builder image.
 
-Установщик поддерживает именно Ubuntu. Docker должен быть установлен заранее и установщиком не изменяется.
+Установщик добавляет `python3`, `git`, `util-linux` и CA certificates. Docker должен быть установлен заранее.
 
-## 🔄 Обновление
+## ⚠️ Ограничения и эксплуатационные нюансы
 
-```bash
-cd /opt/node-xhttp
-sudo git pull
-sudo ./install.sh
-```
-
-Существующая конфигурация сохраняется.
-
-## 🧪 Проверка и ручной запуск
-
-### Безопасное сканирование
-
-```bash
-sudo remnanode-xhttp-clean status
-sudo remnanode-xhttp-clean scan
-sudo remnanode-xhttp-clean clean --dry-run
-```
-
-Эти команды ничего не закрывают.
-
-### Ручная очистка
-
-```bash
-sudo remnanode-xhttp-clean clean
-```
-
-### Тесты проекта
-
-```bash
-cd /opt/node-xhttp
-python3 -m py_compile remnanode-xhttp-clean.py
-python3 -m unittest -v tests/test_cleaner.py
-bash tests/test_install.sh
-```
-
-<a id="limitations"></a>
-
-## ⚠️ Ограничения
-
-- Программа видит только существующие TCP-сокеты и связанные с ними буферы, а не произвольные объекты Go heap Xray.
-- XHTTP через Unix-domain socket не обрабатывается.
-- XHTTP-listener должен иметь одиночный числовой TCP-порт, а `listen` — IP-адрес, wildcard или пустое значение.
-- Длительно простаивающий клиент после закрытия может создать соединение повторно.
-- Между финальным чтением `TCP_INFO` и `SOCK_DESTROY` остаётся очень короткий интервал, в котором старый сокет теоретически может получить пакет. Новый socket object защищён kernel cookie.
-- Освобождение буферов не гарантирует немедленного уменьшения RSS процесса.
+- Установка нового ядра и автоматическое применение после обновления требуют перезапуска контейнера; текущие соединения на этот момент оборвутся.
+- Источником форка служит официальный `XTLS/Xray-core`. Контейнер с другим приватным форком при несовместимой структуре не пройдёт gate.
+- `debug.FreeOSMemory()` помогает вернуть свободные страницы ОС, но итоговый RSS зависит также от активных соединений, других подсистем Xray и фрагментации heap.
+- Скрипт не редактирует RemnaNode config, Docker Compose или лимиты памяти.
+- Откат нельзя безопасно автоматизировать через смену ID контейнера без точного знания новой версии; в таком случае операция останавливается.
 
 ## 🗑️ Удаление
-
-Через панель с подтверждением словом `УДАЛИТЬ`:
 
 ```bash
 xhttp-cleaner uninstall
 ```
 
-Напрямую:
-
-```bash
-sudo remnanode-xhttp-clean uninstall
-```
-
-Будут удалены service, timer, конфигурация и обе установленные команды. Исходники в `/opt/node-xhttp` сохранятся.
+После подтверждения программа восстановит stock Xray, перезапустит контейнер, а затем удалит service, timer, команды, backup и build cache. Исходный Git-репозиторий в `/opt/node-xhttp` останется.
 
 ## 📚 Технические источники
 
-- [Xray-core: серверные XHTTP-сессии и upload queue](https://github.com/XTLS/Xray-core/blob/main/transport/internet/splithttp/hub.go)
-- [`ss(8)`: TCP_INFO `lastsnd` и `lastrcv`](https://man7.org/linux/man-pages/man8/ss.8.html)
-- [`sock_diag(7)`: диагностика сокетов через netlink](https://man7.org/linux/man-pages/man7/sock_diag.7.html)
-- [iproute2: отправка `SOCK_DESTROY` с `inet_diag_sockid`](https://kernel.googlesource.com/pub/scm/network/iproute2/iproute2/+/refs/heads/main/misc/ss.c)
-- [Linux UAPI: `inet_diag_sockid.idiag_cookie`](https://codebrowser.dev/linux/linux/include/uapi/linux/inet_diag.h.html)
+- [Xray-core XHTTP session handler](https://github.com/XTLS/Xray-core/blob/v26.6.27/transport/internet/splithttp/hub.go)
+- [Xray-core upload queue](https://github.com/XTLS/Xray-core/blob/v26.6.27/transport/internet/splithttp/upload_queue.go)
+- [Go `debug.FreeOSMemory`](https://pkg.go.dev/runtime/debug#FreeOSMemory)
+- [RemnaNode Dockerfile](https://github.com/remnawave/node/blob/main/Dockerfile)
+- [Linux `sock_diag(7)`](https://man7.org/linux/man-pages/man7/sock_diag.7.html)
 
 ---
 
 <div align="center">
 
-Сделано с вниманием к безопасности соединений — **by Bankaev**
+Сделано **by Bankaev**
 
 [⬆ Вернуться к началу](#-remnanode-xhttp-cleaner)
 

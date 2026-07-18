@@ -4,8 +4,9 @@ set -Eeuo pipefail
 
 readonly APP_NAME="XHTTP Cleaner"
 readonly AUTHOR="Bankaev"
-readonly VERSION="2.2.0"
+readonly VERSION="3.0.0"
 readonly CLEANER="/usr/local/sbin/remnanode-xhttp-clean"
+readonly CORE_MANAGER="/usr/local/lib/remnanode-xhttp-clean/xray-core-manager"
 readonly PROJECT_DIR="/opt/node-xhttp"
 readonly INSTALLER="$PROJECT_DIR/install.sh"
 readonly SERVICE="remnanode-xhttp-clean.service"
@@ -92,7 +93,7 @@ status_value() {
 draw_dashboard() {
     local cpu ram disk ram_pct ram_used ram_total disk_pct disk_used disk_total cores
     local timer_active timer_enabled cleaner_status container image rss sockets stale xhttp_stale idle ports
-    local xhttp_ports xhttp_discovery
+    local xhttp_ports xhttp_discovery core_status core_version core_patched
     local last_result last_closed next_run cleaner_state cleaner_color
 
     cpu="$(cpu_percent)"
@@ -109,16 +110,19 @@ draw_dashboard() {
         cleaner_color="$RED"
     fi
     cleaner_status="$($CLEANER status 2>&1 || true)"
+    core_status="$($CORE_MANAGER status 2>&1 || true)"
     container="$(status_value container "$cleaner_status")"
     image="$(status_value image "$cleaner_status")"
     rss="$(status_value xray_rss_mb "$cleaner_status")"
     sockets="$(status_value owned_tcp_sockets "$cleaner_status")"
     stale="$(status_value stale_outbound_sockets "$cleaner_status")"
-    xhttp_stale="$(status_value stale_xhttp_buffers "$cleaner_status")"
+    xhttp_stale="$(status_value stale_xhttp_sockets "$cleaner_status")"
     xhttp_ports="$(status_value xhttp_listeners "$cleaner_status")"
     xhttp_discovery="$(status_value xhttp_discovery "$cleaner_status")"
     idle="$(status_value idle_seconds "$cleaner_status")"
     ports="$(status_value listening_ports "$cleaner_status")"
+    core_version="$(status_value core_version "$core_status")"
+    core_patched="$(status_value core_patched "$core_status")"
     last_result="$(systemctl show "$SERVICE" -p Result --value 2>/dev/null || true)"
     last_closed="$(journalctl -u "$SERVICE" -n 300 --no-pager 2>/dev/null | sed -n 's/.*Закрыто по inode + kernel cookie: //p' | tail -n 1)"
     next_run="$(systemctl list-timers "$TIMER" --no-legend --no-pager 2>/dev/null | awk 'NF { print $1, $2, $3, $4; exit }')"
@@ -133,10 +137,11 @@ draw_dashboard() {
     printf '%s╠─[ STATUS ]───────────────────────────────────────────────────╣%s\n' "$GOLD" "$RESET"
     printf '%s║%s Очиститель         : %s%-39s%s%s║%s\n' "$GOLD" "$RESET" "$cleaner_color" "$cleaner_state" "$RESET" "$GOLD" "$RESET"
     printf '%s║%s RemnaNode          : %-39s%s║%s\n' "$GOLD" "$RESET" "${container:-недоступен} ${image:-}" "$GOLD" "$RESET"
+    printf '%s║%s Xray Core Fork     : %-39s%s║%s\n' "$GOLD" "$RESET" "v${core_version:-?}; patched=${core_patched:-?}" "$GOLD" "$RESET"
     printf '%s║%s Xray RSS           : %-39s%s║%s\n' "$GOLD" "$RESET" "${rss:-?} MiB" "$GOLD" "$RESET"
     printf '%s║%s TCP-сокеты Xray    : %-39s%s║%s\n' "$GOLD" "$RESET" "${sockets:-?}" "$GOLD" "$RESET"
     printf '%s║%s Старые outbound    : %-39s%s║%s\n' "$GOLD" "$RESET" "${stale:-?}" "$GOLD" "$RESET"
-    printf '%s║%s Старые XHTTP буф.  : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_stale:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Старые XHTTP TCP   : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_stale:-?}" "$GOLD" "$RESET"
     printf '%s║%s XHTTP listeners    : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_ports:-нет} (${xhttp_discovery:-?})" "$GOLD" "$RESET"
     printf '%s║%s Listening-порты    : %-39s%s║%s\n' "$GOLD" "$RESET" "${ports:-?}" "$GOLD" "$RESET"
     printf '%s║%s Последняя очистка  : %-39s%s║%s\n' "$GOLD" "$RESET" "${last_result:-нет}; закрыто ${last_closed:-0}" "$GOLD" "$RESET"
@@ -174,7 +179,16 @@ run_tests() {
     }
     cd "$PROJECT_DIR"
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests/test_cleaner.py
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests/test_core_manager.py tests/test_xray_patcher.py
     bash tests/test_install.sh
+}
+
+update_core() {
+    "$CORE_MANAGER" ensure --retry-failed
+}
+
+rollback_core() {
+    "$CORE_MANAGER" rollback
 }
 
 reinstall_cleaner() {
@@ -207,8 +221,10 @@ show_menu() {
     printf '  %s[5]%s ▶  Включить программу и timer\n' "$GREEN" "$RESET"
     printf '  %s[6]%s ⏸  Выключить программу и timer\n' "$ORANGE" "$RESET"
     printf '  %s[7]%s 🧪 Запустить тесты\n' "$GOLD" "$RESET"
-    printf '  %s[8]%s 🔄 Переустановить программу\n' "$GOLD" "$RESET"
-    printf '  %s[9]%s 🗑  Удалить установленную программу\n' "$RED" "$RESET"
+    printf '  %s[8]%s 🧬 Пересобрать/обновить форк Xray\n' "$GOLD" "$RESET"
+    printf '  %s[9]%s ↩  Откатить оригинальное ядро Xray\n' "$ORANGE" "$RESET"
+    printf '  %s[r]%s 🔄 Переустановить программу\n' "$GOLD" "$RESET"
+    printf '  %s[d]%s 🗑  Удалить установленную программу\n' "$RED" "$RESET"
     printf '  %s[q]%s Выйти\n\n' "$GRAY" "$RESET"
 }
 
@@ -228,8 +244,10 @@ interactive_menu() {
             5) enable_cleaner; pause_menu ;;
             6) disable_cleaner; pause_menu ;;
             7) run_tests; pause_menu ;;
-            8) reinstall_cleaner; pause_menu ;;
-            9) uninstall_cleaner; return 0 ;;
+            8) update_core; pause_menu ;;
+            9) rollback_core; pause_menu ;;
+            r|R|к|К) reinstall_cleaner; pause_menu ;;
+            d|D|в|В) uninstall_cleaner; return 0 ;;
             q|Q|й|Й) return 0 ;;
             *) printf '%sНеизвестный пункт.%s\n' "$RED" "$RESET"; sleep 1 ;;
         esac
@@ -250,8 +268,10 @@ logs [--follow]   показать журнал службы
 enable            включить timer и сразу выполнить очистку
 disable           выключить timer
 test              запустить тесты
+core-update       проверить совместимость, собрать и установить форк Xray
+core-rollback     восстановить сохранённый оригинальный Xray
 reinstall         переустановить из $PROJECT_DIR
-uninstall         удалить установленную службу
+uninstall         восстановить stock Xray и удалить программу
 EOF
 }
 
@@ -277,6 +297,8 @@ main() {
         enable|start) enable_cleaner ;;
         disable|stop) disable_cleaner ;;
         test|tests) run_tests ;;
+        core-update|core-ensure) update_core ;;
+        core-rollback) rollback_core ;;
         reinstall) reinstall_cleaner ;;
         uninstall|remove) uninstall_cleaner ;;
         *) usage >&2; return 2 ;;

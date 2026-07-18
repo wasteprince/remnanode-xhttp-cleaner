@@ -20,12 +20,16 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "2.2.0"
+VERSION = "3.0.0"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))
 INSTALL_PATH = Path("/usr/local/sbin/remnanode-xhttp-clean")
 CONTROL_PATH = Path("/usr/local/bin/xhttp-cleaner")
+CORE_MANAGER_PATH = Path("/usr/local/lib/remnanode-xhttp-clean/xray-core-manager")
+CORE_MANAGER_ROOT = Path("/usr/local/lib/remnanode-xhttp-clean")
+CORE_STATE_ROOT = Path("/var/lib/remnanode-xhttp-clean")
+CORE_CACHE_ROOT = Path("/var/cache/remnanode-xhttp-clean")
 SERVICE_PATH = Path("/etc/systemd/system/remnanode-xhttp-clean.service")
 TIMER_PATH = Path("/etc/systemd/system/remnanode-xhttp-clean.timer")
 
@@ -680,7 +684,7 @@ def process_rss_mb(pid: int) -> int:
 
 def print_records(records: Sequence[Dict[str, object]]) -> None:
     if not records:
-        print("Подходящих неактивных сокетов и XHTTP-буферов нет.")
+        print("Подходящих неактивных TCP-сокетов нет.")
         return
     print(
         "TYPE          STATE        IDLE       LOCAL                         "
@@ -710,7 +714,7 @@ def command_status(config: Config) -> None:
     stale_outbound = sum(1 for item in candidates if item["kind"] == "OUTBOUND")
     stale_xhttp = sum(1 for item in candidates if item["kind"] == "XHTTP-BUFFER")
     print(f"stale_outbound_sockets={stale_outbound}")
-    print(f"stale_xhttp_buffers={stale_xhttp}")
+    print(f"stale_xhttp_sockets={stale_xhttp}")
     print(f"xhttp_listeners={','.join(result['xhttp_listeners'])}")
     print(f"xhttp_discovery={result['xhttp_discovery']}")
     print(f"idle_seconds={config.idle_seconds}")
@@ -734,7 +738,7 @@ def command_clean(config: Config, dry_run: bool) -> None:
     outbound_closed = sum(1 for item in closed if item["kind"] == "OUTBOUND")
     print(f"Найдено перед повторной проверкой: {len(candidates)}")
     print(f"Закрыто по inode + kernel cookie: {len(closed)}")
-    print(f"Освобождено старых XHTTP-буферов: {xhttp_closed}")
+    print(f"Закрыто старых XHTTP TCP-сокетов: {xhttp_closed}")
     print(f"Закрыто старых исходящих сокетов: {outbound_closed}")
     print(f"Пропущено как изменившиеся/активные: {result['skipped_changed']}")
     print_records(closed)  # type: ignore[arg-type]
@@ -779,12 +783,13 @@ def command_install(config: Config) -> None:
     atomic_write(
         SERVICE_PATH,
         """[Unit]
-Description=XHTTP Cleaner by Bankaev - clean stale rw-core sockets and XHTTP buffers
+Description=XHTTP Cleaner by Bankaev - maintain patched Xray and clean stale rw-core sockets
 After=docker.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/local/lib/remnanode-xhttp-clean/xray-core-manager ensure --nonfatal
 ExecStart=/usr/local/sbin/remnanode-xhttp-clean clean
 Nice=10
 """,
@@ -810,15 +815,29 @@ WantedBy=timers.target
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "remnanode-xhttp-clean.timer"])
     print(
-        f"Установлено. Сокеты и XHTTP-буферы без данных >= {config.idle_seconds} с "
-        "будут очищаться каждые 5 минут."
+        f"Установлено. Форк Xray и TCP-сокеты без данных >= {config.idle_seconds} с "
+        "будут проверяться каждые 5 минут."
     )
 
 
 def command_uninstall() -> None:
     require_root()
+    timer_was_enabled = False
     if shutil.which("systemctl"):
+        timer_was_enabled = (
+            run(["systemctl", "is-enabled", "remnanode-xhttp-clean.timer"], check=False).returncode
+            == 0
+        )
         run(["systemctl", "disable", "--now", "remnanode-xhttp-clean.timer"], check=False)
+    try:
+        if CORE_MANAGER_PATH.exists():
+            # Do not remove rollback metadata while a patched binary is still
+            # in the container. A failed restore aborts uninstall safely.
+            run([str(CORE_MANAGER_PATH), "restore-if-patched"])
+    except BaseException:
+        if timer_was_enabled and shutil.which("systemctl"):
+            run(["systemctl", "enable", "--now", "remnanode-xhttp-clean.timer"], check=False)
+        raise
     for path in (SERVICE_PATH, TIMER_PATH, CONFIG_PATH, INSTALL_PATH, CONTROL_PATH):
         try:
             path.unlink()
@@ -826,14 +845,17 @@ def command_uninstall() -> None:
             pass
     if shutil.which("systemctl"):
         run(["systemctl", "daemon-reload"], check=False)
-    print("Timer, service, конфигурация и установленный скрипт удалены.")
+    shutil.rmtree(CORE_MANAGER_ROOT, ignore_errors=True)
+    shutil.rmtree(CORE_STATE_ROOT, ignore_errors=True)
+    shutil.rmtree(CORE_CACHE_ROOT, ignore_errors=True)
+    print("Оригинальный Xray восстановлен; timer, service и файлы XHTTP Cleaner удалены.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
         description=(
-            "Очистка исходящих TCP-сокетов и XHTTP-буферов rw-core "
+            "Сопровождение форка Xray и очистка старых TCP-сокетов rw-core "
             "без активности не менее 5 минут."
         ),
     )
