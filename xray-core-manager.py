@@ -413,14 +413,16 @@ def wait_healthy(
         process_evidence = running_core_evidence(container, binary)
         process_ok = bool(process_evidence)
         marker_ok = True
+        marker_display: str | bool = "not-required"
         if expected_marker is not None:
             try:
                 marker_ok = expected_marker in version_statement(container, binary)
             except CoreManagerError:
                 marker_ok = False
+            marker_display = marker_ok
         last = (
             f"running={running} health={health} xray_process={process_ok} "
-            f"marker={marker_ok} evidence={process_evidence or 'none'}"
+            f"marker={marker_display} evidence={process_evidence or 'none'}"
         )
         if running == "true" and process_ok and marker_ok and health in ("none", "healthy"):
             return
