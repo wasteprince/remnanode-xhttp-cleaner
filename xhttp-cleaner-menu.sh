@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly APP_NAME="XHTTP Cleaner"
 readonly AUTHOR="Bankaev"
-readonly VERSION="3.0.0"
+readonly VERSION="3.0.1"
 readonly CLEANER="/usr/local/sbin/remnanode-xhttp-clean"
 readonly CORE_MANAGER="/usr/local/lib/remnanode-xhttp-clean/xray-core-manager"
 readonly PROJECT_DIR="/opt/node-xhttp"

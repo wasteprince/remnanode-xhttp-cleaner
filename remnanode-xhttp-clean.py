@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))

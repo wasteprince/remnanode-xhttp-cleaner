@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 PATCH_ID = "xhttp-cleaner-v3"
 DEFAULT_CONFIG = Path("/etc/remnanode-xhttp-clean.json")
 STATE_ROOT = Path("/var/lib/remnanode-xhttp-clean")
@@ -323,27 +323,114 @@ def copy_from_container(container: str, source: str, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def wait_healthy(container: str, expected_marker: str | None, timeout: int = 90) -> None:
+def top_has_core_process(output: str, binary: str) -> bool:
+    binary_lower = binary.lower()
+    for line in output.splitlines()[1:]:
+        lowered = line.lower()
+        fields = lowered.split(None, 2)
+        command = fields[1] if len(fields) > 1 else ""
+        arguments = fields[2] if len(fields) > 2 else ""
+        if command in ("rw-core", "rwcore", "xray") or binary_lower in arguments:
+            return True
+    return False
+
+
+def running_core_evidence(container: str, binary: str) -> str:
+    # Compare /proc/<pid>/exe with the resolved binary path. This works across
+    # s6, supervisor and custom process names and does not mistake a new
+    # process merely because its command line resembles Xray.
+    script = r'''
+target="$1"
+for proc in /proc/[0-9]*; do
+    executable="$(readlink "$proc/exe" 2>/dev/null || true)"
+    if [ "$executable" = "$target" ]; then
+        printf '%s\t%s\n' "${proc##*/}" "$executable"
+    fi
+done
+'''
+    completed = run(
+        ["docker", "exec", container, "sh", "-c", script, "xhttp-cleaner-proc-scan", binary],
+        check=False,
+    )
+    evidence = (completed.stdout or "").strip()
+    if completed.returncode == 0 and evidence:
+        return evidence
+
+    # Fallback for extremely small images without a usable /bin/sh/readlink.
+    top = run(["docker", "top", container, "-eo", "pid,comm,args"], check=False)
+    top_output = top.stdout or ""
+    if top.returncode == 0 and top_has_core_process(top_output, binary):
+        return "docker-top-match"
+    return ""
+
+
+def write_diagnostics(container: str, binary: str, phase: str) -> Path:
+    diagnostics = STATE_ROOT / "diagnostics"
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    os.chmod(diagnostics, 0o700)
+
+    def diagnostic_command(command: Sequence[str]) -> dict[str, Any]:
+        try:
+            completed = run(command, check=False, timeout=20)
+            return {
+                "returncode": completed.returncode,
+                "stdout": (completed.stdout or "")[-30000:],
+                "stderr": (completed.stderr or "")[-10000:],
+            }
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"error": str(exc)}
+
+    payload = {
+        "phase": phase,
+        "created_at": int(time.time()),
+        "container": container,
+        "binary": binary,
+        "process_evidence": running_core_evidence(container, binary),
+        "state": diagnostic_command(
+            [
+                "docker", "inspect", "-f",
+                "running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}",
+                container,
+            ]
+        ),
+        "top": diagnostic_command(["docker", "top", container, "-eo", "pid,comm,args"]),
+        "version": diagnostic_command(["docker", "exec", container, binary, "version"]),
+        "logs": diagnostic_command(["docker", "logs", "--tail", "200", container]),
+    }
+    path = diagnostics / f"{int(time.time())}-{phase}-{os.getpid()}.json"
+    atomic_json(path, payload)
+    return path
+
+
+def wait_healthy(
+    container: str, expected_marker: str | None, binary: str, timeout: int = 90
+) -> None:
     deadline = time.monotonic() + timeout
     last = ""
     while time.monotonic() < deadline:
         running = docker(container, "inspect", "-f", "{{.State.Running}}", container, check=False)
         health = docker(container, "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", container, check=False)
-        top = docker(container, "top", container, "-eo", "comm,args", check=False)
-        process_ok = bool(re.search(r"(?m)(^|\s)(rw-core|xray)(\s|$)|/usr/local/bin/(rw-core|xray)", top))
+        process_evidence = running_core_evidence(container, binary)
+        process_ok = bool(process_evidence)
         marker_ok = True
         if expected_marker is not None:
             try:
-                marker_ok = expected_marker in version_statement(container, core_path(container))
+                marker_ok = expected_marker in version_statement(container, binary)
             except CoreManagerError:
                 marker_ok = False
-        last = f"running={running} health={health} xray_process={process_ok} marker={marker_ok}"
+        last = (
+            f"running={running} health={health} xray_process={process_ok} "
+            f"marker={marker_ok} evidence={process_evidence or 'none'}"
+        )
         if running == "true" and process_ok and marker_ok and health in ("none", "healthy"):
             return
         if health == "unhealthy" or running == "false":
             break
         time.sleep(2)
-    raise CoreManagerError(f"container did not become healthy after core restart: {last}")
+    diagnostics = write_diagnostics(container, binary, "health-failure")
+    raise CoreManagerError(
+        f"container did not become healthy after core restart: {last}; diagnostics={diagnostics}"
+    )
 
 
 def stock_core_is_running(container: str) -> bool:
@@ -351,10 +438,7 @@ def stock_core_is_running(container: str) -> bool:
         if docker(container, "inspect", "-f", "{{.State.Running}}", container, check=False) != "true":
             return False
         info = current_info(container)
-        top = docker(container, "top", container, "-eo", "comm,args", check=False)
-        process_ok = bool(
-            re.search(r"(?m)(^|\s)(rw-core|xray)(\s|$)|/usr/local/bin/(rw-core|xray)", top)
-        )
+        process_ok = bool(running_core_evidence(container, info["binary"]))
         return info["patched"] == "false" and process_ok
     except (CoreManagerError, OSError):
         return False
@@ -419,7 +503,7 @@ def deploy(container: str, info: dict[str, str], artifact: Path) -> None:
         settings_after = preserved_container_settings(run(["docker", "inspect", container]).stdout or "[]")
         if settings_after != settings_before:
             raise CoreManagerError("Docker container settings changed unexpectedly during restart")
-        wait_healthy(container, PATCH_ID)
+        wait_healthy(container, PATCH_ID, info["binary"])
         atomic_json(
             STATE_ROOT / "deployment.json",
             {
@@ -440,7 +524,12 @@ def deploy(container: str, info: dict[str, str], artifact: Path) -> None:
     except BaseException as exc:
         if replaced:
             print(f"core-deploy: validation failed, rolling back: {exc}", file=sys.stderr, flush=True)
-            rollback_binary(container, info["binary"], backup, info["container_id"])
+            try:
+                rollback_binary(container, info["binary"], backup, info["container_id"])
+            except BaseException as rollback_exc:
+                raise CoreManagerError(
+                    f"deployment failed: {exc}; rollback also failed: {rollback_exc}"
+                ) from exc
         raise
 
 
@@ -456,7 +545,7 @@ def rollback_binary(container: str, binary: str, backup: Path, expected_containe
     run(["docker", "restart", container], timeout=120)
     if docker(container, "inspect", "-f", "{{.Id}}", container) != expected_container_id:
         raise CoreManagerError("container identity changed during rollback")
-    wait_healthy(container, None)
+    wait_healthy(container, None, binary)
 
 
 def ensure(container: str, *, retry_failed: bool = False) -> str:
@@ -535,6 +624,7 @@ def print_status(container: str) -> None:
     print(f"core_arch={info['arch']}")
     print(f"core_patch_id={PATCH_ID}")
     print(f"core_patched={info['patched']}")
+    print(f"core_process_running={str(bool(running_core_evidence(container, info['binary']))).lower()}")
     print(f"core_artifact_cached={str(artifact.is_file()).lower()}")
 
 

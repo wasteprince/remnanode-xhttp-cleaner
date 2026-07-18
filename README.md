@@ -4,12 +4,12 @@
 
 ### Версионно-адаптивный форк Xray с внутренней очисткой старых XHTTP-буферов
 
-[![Version](https://img.shields.io/badge/version-3.0.0-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
+[![Version](https://img.shields.io/badge/version-3.0.1-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-supported-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](#-требования)
 [![Xray](https://img.shields.io/badge/Xray-version--matched-1686F0?style=for-the-badge)](#-как-работает-обновление)
 [![License](https://img.shields.io/github/license/wasteprince/remnanode-xhttp-cleaner?style=for-the-badge&color=22c55e)](LICENSE)
 
-**XHTTP Cleaner v3.0.0 · by Bankaev**
+**XHTTP Cleaner v3.0.1 · by Bankaev**
 
 [Установка](#-быстрая-установка) · [Принцип работы](#-как-это-работает) · [Управление](#-управление) · [Обновления](#-как-работает-обновление) · [Откат](#-откат)
 
@@ -18,7 +18,7 @@
 ---
 
 > [!IMPORTANT]
-> Версия 3.0.0 действительно изменяет Xray: собирает форк ровно от версии ядра, найденной в запущенном контейнере, атомарно заменяет `/usr/local/bin/xray` и перезапускает **тот же** контейнер. Контейнер не пересоздаётся, поэтому его env, mounts, ports, networks и restart policy сохраняются.
+> Версия 3.0.1 действительно изменяет Xray: собирает форк ровно от версии ядра, найденной в запущенном контейнере, атомарно заменяет `/usr/local/bin/xray` и перезапускает **тот же** контейнер. Контейнер не пересоздаётся, поэтому его env, mounts, ports, networks и restart policy сохраняются.
 
 ## ✨ Что делает программа
 
@@ -223,6 +223,16 @@ bash tests/test_install.sh
 - `debug.FreeOSMemory()` помогает вернуть свободные страницы ОС, но итоговый RSS зависит также от активных соединений, других подсистем Xray и фрагментации heap.
 - Скрипт не редактирует RemnaNode config, Docker Compose или лимиты памяти.
 - Откат нельзя безопасно автоматизировать через смену ID контейнера без точного знания новой версии; в таком случае операция останавливается.
+
+### Диагностика неуспешного запуска
+
+Health-check ищет запущенное ядро по `/proc/<pid>/exe`, поэтому не зависит от имени процесса или от того, используется s6 либо supervisor. Если контейнер не прошёл проверку, перед откатом создаётся файл:
+
+```text
+/var/lib/remnanode-xhttp-clean/diagnostics/*-health-failure-*.json
+```
+
+В нём находятся состояние контейнера, список процессов, версия установленного бинарника и последние 200 строк Docker-лога. Файл имеет права `0600`; он может содержать IP-адреса и другие данные из журнала, поэтому перед публикацией его следует проверить.
 
 ## 🗑️ Удаление
 

@@ -62,6 +62,24 @@ class CoreManagerTests(unittest.TestCase):
             manager.preserved_container_settings(json.dumps(changed_runtime)),
         )
 
+    def test_docker_top_process_detection_supports_old_and_new_launchers(self):
+        header = "PID COMMAND COMMAND\n"
+        self.assertTrue(
+            manager.top_has_core_process(
+                header + "123 RWCore /usr/local/bin/rw-core run -c /var/lib/rnode/config.json\n",
+                "/usr/local/bin/xray",
+            )
+        )
+        self.assertTrue(
+            manager.top_has_core_process(
+                header + "123 custom /usr/local/bin/xray run -c config.json\n",
+                "/usr/local/bin/xray",
+            )
+        )
+        self.assertFalse(
+            manager.top_has_core_process(header + "1 s6-svscan /init\n", "/usr/local/bin/xray")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
