@@ -115,6 +115,7 @@ config = {
     "idle_seconds": 300,
     "include_inbound": False,
     "exclude_loopback": True,
+    "clean_xhttp_buffers": True,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove stale outbound TCP sockets owned by RemnaNode's rw-core process."""
+"""Remove stale outbound and XHTTP TCP sockets owned by RemnaNode's rw-core."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))
@@ -63,6 +63,7 @@ class Config:
     idle_seconds: int = 300
     include_inbound: bool = False
     exclude_loopback: bool = True
+    clean_xhttp_buffers: bool = True
 
     @classmethod
     def load(cls) -> "Config":
@@ -89,8 +90,24 @@ class Config:
             raise CleanerError("idle_seconds должен быть целым числом")
         if self.idle_seconds < 300:
             raise CleanerError("idle_seconds нельзя устанавливать меньше 300 секунд")
-        if not isinstance(self.include_inbound, bool) or not isinstance(self.exclude_loopback, bool):
-            raise CleanerError("include_inbound и exclude_loopback должны быть boolean")
+        boolean_fields = (self.include_inbound, self.exclude_loopback, self.clean_xhttp_buffers)
+        if not all(isinstance(value, bool) for value in boolean_fields):
+            raise CleanerError(
+                "include_inbound, exclude_loopback и clean_xhttp_buffers должны быть boolean"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class XhttpListener:
+    address: str
+    port: int
+    tag: str = ""
+
+    @property
+    def endpoint(self) -> str:
+        if ":" in self.address and self.address not in ("", "*"):
+            return f"[{self.address}]:{self.port}"
+        return f"{self.address or '*'}:{self.port}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -335,23 +352,127 @@ def is_loopback(address: str) -> bool:
         return False
 
 
-def candidate_reason(
+def parse_xhttp_listeners(raw_config: object) -> List[XhttpListener]:
+    """Extract TCP XHTTP listeners from an already rendered Xray config."""
+    if not isinstance(raw_config, dict):
+        return []
+    inbounds = raw_config.get("inbounds", [])
+    if not isinstance(inbounds, list):
+        return []
+
+    listeners: List[XhttpListener] = []
+    seen: Set[Tuple[str, int]] = set()
+    for inbound in inbounds:
+        if not isinstance(inbound, dict):
+            continue
+        stream = inbound.get("streamSettings", {})
+        if not isinstance(stream, dict):
+            continue
+        network = str(stream.get("network", "")).lower()
+        if network not in ("xhttp", "splithttp"):
+            continue
+        port_value = inbound.get("port")
+        if isinstance(port_value, bool):
+            continue
+        try:
+            port = int(port_value)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= port <= 65535:
+            continue
+        listen_value = inbound.get("listen", "")
+        address = listen_value.strip() if isinstance(listen_value, str) else ""
+        # Unix-domain XHTTP has no TCP socket that NETLINK_SOCK_DIAG can close.
+        if address.startswith("/") or address.startswith("@"):
+            continue
+        tag_value = inbound.get("tag", "")
+        tag = tag_value if isinstance(tag_value, str) else ""
+        key = (address, port)
+        if key not in seen:
+            listeners.append(XhttpListener(address=address, port=port, tag=tag))
+            seen.add(key)
+    return listeners
+
+
+def _normalized_ip(address: str) -> Optional[ipaddress._BaseAddress]:
+    try:
+        return ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def xhttp_listener_matches(record: SocketRecord, listener: XhttpListener) -> bool:
+    if record.local_port != listener.port:
+        return False
+    address = listener.address.strip()
+    if not address or address == "*":
+        return True
+    configured = _normalized_ip(address.strip("[]"))
+    local = _normalized_ip(record.local_address)
+    if configured is None or local is None:
+        return False
+    if configured.is_unspecified:
+        return configured.version == local.version
+    if configured == local:
+        return True
+    # An IPv4 connection accepted by a dual-stack IPv6 listener is represented
+    # as an IPv4-mapped IPv6 address in inet_diag.
+    return bool(
+        isinstance(local, ipaddress.IPv6Address)
+        and local.ipv4_mapped is not None
+        and local.ipv4_mapped == configured
+    )
+
+
+def matching_xhttp_listener(
+    record: SocketRecord, listeners: Sequence[XhttpListener]
+) -> Optional[XhttpListener]:
+    return next((item for item in listeners if xhttp_listener_matches(record, item)), None)
+
+
+def candidate_kind(
     record: SocketRecord,
     owned_inodes: Set[int],
     listen_ports: Set[int],
     config: Config,
+    xhttp_listeners: Sequence[XhttpListener] = (),
 ) -> Optional[str]:
     if record.state not in TARGET_STATES or record.inode not in owned_inodes:
         return None
-    if not config.include_inbound and record.local_port in listen_ports:
-        return None
-    if config.exclude_loopback and (
+    xhttp_listener = matching_xhttp_listener(record, xhttp_listeners)
+    is_xhttp = xhttp_listener is not None and config.clean_xhttp_buffers
+    if record.local_port in listen_ports:
+        if is_xhttp:
+            kind = "XHTTP-BUFFER"
+        elif config.include_inbound:
+            kind = "INBOUND"
+        else:
+            return None
+    else:
+        kind = "OUTBOUND"
+    # A recognized XHTTP listener may intentionally be loopback-only behind a
+    # reverse proxy. Other loopback traffic remains protected by the old rule.
+    if config.exclude_loopback and kind != "XHTTP-BUFFER" and (
         is_loopback(record.local_address) or is_loopback(record.remote_address)
     ):
         return None
     idle_ms = record.idle_ms
     if idle_ms is None or idle_ms < config.idle_seconds * 1000:
         return None
+    return kind
+
+
+def candidate_reason(
+    record: SocketRecord,
+    owned_inodes: Set[int],
+    listen_ports: Set[int],
+    config: Config,
+    xhttp_listeners: Sequence[XhttpListener] = (),
+) -> Optional[str]:
+    kind = candidate_kind(record, owned_inodes, listen_ports, config, xhttp_listeners)
+    if kind is None:
+        return None
+    idle_ms = record.idle_ms or 0
     return f"нет передачи данных {idle_ms // 1000} с"
 
 
@@ -363,7 +484,12 @@ def dump_all(client: DiagClient) -> List[SocketRecord]:
     return records
 
 
-def worker(pid: int, config: Config, apply: bool) -> Dict[str, object]:
+def worker(
+    pid: int,
+    config: Config,
+    apply: bool,
+    xhttp_listeners: Sequence[XhttpListener] = (),
+) -> Dict[str, object]:
     owned_before = owned_socket_inodes(pid)
     with DiagClient() as client:
         records = dump_all(client)
@@ -373,20 +499,25 @@ def worker(pid: int, config: Config, apply: bool) -> Dict[str, object]:
             if item.state == TCP_LISTEN and item.inode in owned_before
         }
         candidates = [
-            item
+            (item, kind)
             for item in records
-            if candidate_reason(item, owned_before, listen_ports, config) is not None
+            if (
+                kind := candidate_kind(
+                    item, owned_before, listen_ports, config, xhttp_listeners
+                )
+            )
+            is not None
         ]
-        candidates.sort(key=lambda item: item.idle_ms or 0, reverse=True)
+        candidates.sort(key=lambda pair: pair[0].idle_ms or 0, reverse=True)
 
-        closed: List[SocketRecord] = []
+        closed: List[Tuple[SocketRecord, str]] = []
         skipped_changed = 0
         if apply:
             # Refresh ownership once after the initial dump. Re-reading tens of
             # thousands of fd symlinks for every candidate would be O(n²).
             # Per-socket tuple reuse is still guarded by query_exact + cookie.
             owned_now = owned_socket_inodes(pid)
-            for original in candidates:
+            for original, original_kind in candidates:
                 # Re-query by the original kernel cookie immediately before destroy.
                 # A newly-created socket may have the same IP/ports/inode, but never
                 # the same cookie, so it cannot pass this check or be destroyed.
@@ -394,11 +525,14 @@ def worker(pid: int, config: Config, apply: bool) -> Dict[str, object]:
                 if current is None or current.identity != original.identity:
                     skipped_changed += 1
                     continue
-                if candidate_reason(current, owned_now, listen_ports, config) is None:
+                current_kind = candidate_kind(
+                    current, owned_now, listen_ports, config, xhttp_listeners
+                )
+                if current_kind != original_kind:
                     skipped_changed += 1
                     continue
                 if client.destroy(current):
-                    closed.append(current)
+                    closed.append((current, current_kind))
                 else:
                     skipped_changed += 1
 
@@ -406,14 +540,16 @@ def worker(pid: int, config: Config, apply: bool) -> Dict[str, object]:
         "pid": pid,
         "owned_sockets": len(owned_before),
         "listen_ports": sorted(listen_ports),
-        "candidates": [record_to_dict(item) for item in candidates],
-        "closed": [record_to_dict(item) for item in closed],
+        "xhttp_listeners": [item.endpoint for item in xhttp_listeners],
+        "candidates": [record_to_dict(item, kind) for item, kind in candidates],
+        "closed": [record_to_dict(item, kind) for item, kind in closed],
         "skipped_changed": skipped_changed,
     }
 
 
-def record_to_dict(record: SocketRecord) -> Dict[str, object]:
+def record_to_dict(record: SocketRecord, kind: str = "OUTBOUND") -> Dict[str, object]:
     return {
+        "kind": kind,
         "state": STATE_NAMES.get(record.state, str(record.state)),
         "local": record.local,
         "remote": record.remote,
@@ -469,11 +605,40 @@ def docker_info(config: Config) -> Tuple[int, int, str]:
     return init_pid, xray_pid, image
 
 
+def discover_xhttp_listeners(config: Config) -> Tuple[List[XhttpListener], str]:
+    """Read only the rendered config; never expose its potentially secret JSON."""
+    if not config.clean_xhttp_buffers:
+        return [], "disabled"
+    attempts = (
+        ["docker", "exec", config.container, "cli", "--dump-config-raw"],
+        ["docker", "exec", config.container, "cli", "-D"],
+    )
+    for command in attempts:
+        completed = run(command, check=False)
+        if completed.returncode != 0 or not completed.stdout.strip():
+            continue
+        output = completed.stdout.strip()
+        try:
+            raw = json.loads(output)
+        except json.JSONDecodeError:
+            # Some CLI builds print a short informational line before the JSON.
+            first, last = output.find("{"), output.rfind("}")
+            if first < 0 or last <= first:
+                continue
+            try:
+                raw = json.loads(output[first : last + 1])
+            except json.JSONDecodeError:
+                continue
+        return parse_xhttp_listeners(raw), "ok"
+    return [], "unavailable"
+
+
 def run_worker(config: Config, apply: bool) -> Dict[str, object]:
     require_root()
     if shutil.which("nsenter") is None:
         raise CleanerError("nsenter не найден; установите пакет util-linux")
     init_pid, xray_pid, _image = docker_info(config)
+    xhttp_listeners, xhttp_discovery = discover_xhttp_listeners(config)
     command = [
         "nsenter",
         "--target",
@@ -487,14 +652,20 @@ def run_worker(config: Config, apply: bool) -> Dict[str, object]:
         str(xray_pid),
         "--config-json",
         json.dumps(dataclasses.asdict(config), separators=(",", ":")),
+        "--xhttp-json",
+        json.dumps(
+            [dataclasses.asdict(item) for item in xhttp_listeners], separators=(",", ":")
+        ),
     ]
     if apply:
         command.append("--apply")
     completed = run(command)
     try:
-        return json.loads(completed.stdout)
+        result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise CleanerError(f"Некорректный ответ worker: {completed.stdout!r}") from exc
+    result["xhttp_discovery"] = xhttp_discovery
+    return result
 
 
 def process_rss_mb(pid: int) -> int:
@@ -509,11 +680,15 @@ def process_rss_mb(pid: int) -> int:
 
 def print_records(records: Sequence[Dict[str, object]]) -> None:
     if not records:
-        print("Подходящих неактивных исходящих сокетов нет.")
+        print("Подходящих неактивных сокетов и XHTTP-буферов нет.")
         return
-    print("STATE        IDLE       LOCAL                         REMOTE                        INODE       COOKIE")
+    print(
+        "TYPE          STATE        IDLE       LOCAL                         "
+        "REMOTE                        INODE       COOKIE"
+    )
     for item in records:
         print(
+            f"{str(item['kind']):<13} "
             f"{str(item['state']):<12} "
             f"{str(item['idle_seconds']) + 's':<10} "
             f"{str(item['local']):<29} "
@@ -531,7 +706,13 @@ def command_status(config: Config) -> None:
     print(f"xray_pid={xray_pid}")
     print(f"xray_rss_mb={process_rss_mb(xray_pid)}")
     print(f"owned_tcp_sockets={result['owned_sockets']}")
-    print(f"stale_outbound_sockets={len(result['candidates'])}")
+    candidates = result["candidates"]
+    stale_outbound = sum(1 for item in candidates if item["kind"] == "OUTBOUND")
+    stale_xhttp = sum(1 for item in candidates if item["kind"] == "XHTTP-BUFFER")
+    print(f"stale_outbound_sockets={stale_outbound}")
+    print(f"stale_xhttp_buffers={stale_xhttp}")
+    print(f"xhttp_listeners={','.join(result['xhttp_listeners'])}")
+    print(f"xhttp_discovery={result['xhttp_discovery']}")
     print(f"idle_seconds={config.idle_seconds}")
     print(f"listening_ports={','.join(map(str, result['listen_ports']))}")
 
@@ -549,8 +730,12 @@ def command_clean(config: Config, dry_run: bool) -> None:
         print_records(candidates)  # type: ignore[arg-type]
         print(f"Dry-run: найдено {len(candidates)}, ничего не закрыто.")
         return
+    xhttp_closed = sum(1 for item in closed if item["kind"] == "XHTTP-BUFFER")
+    outbound_closed = sum(1 for item in closed if item["kind"] == "OUTBOUND")
     print(f"Найдено перед повторной проверкой: {len(candidates)}")
     print(f"Закрыто по inode + kernel cookie: {len(closed)}")
+    print(f"Освобождено старых XHTTP-буферов: {xhttp_closed}")
+    print(f"Закрыто старых исходящих сокетов: {outbound_closed}")
     print(f"Пропущено как изменившиеся/активные: {result['skipped_changed']}")
     print_records(closed)  # type: ignore[arg-type]
 
@@ -594,7 +779,7 @@ def command_install(config: Config) -> None:
     atomic_write(
         SERVICE_PATH,
         """[Unit]
-Description=XHTTP Cleaner by Bankaev - clean stale outbound rw-core sockets
+Description=XHTTP Cleaner by Bankaev - clean stale rw-core sockets and XHTTP buffers
 After=docker.service
 Requires=docker.service
 
@@ -624,7 +809,10 @@ WantedBy=timers.target
     )
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "remnanode-xhttp-clean.timer"])
-    print(f"Установлено. Сокеты без данных >= {config.idle_seconds} с будут очищаться каждые 5 минут.")
+    print(
+        f"Установлено. Сокеты и XHTTP-буферы без данных >= {config.idle_seconds} с "
+        "будут очищаться каждые 5 минут."
+    )
 
 
 def command_uninstall() -> None:
@@ -644,7 +832,10 @@ def command_uninstall() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
-        description="Очистка исходящих TCP-сокетов rw-core без активности не менее 5 минут.",
+        description=(
+            "Очистка исходящих TCP-сокетов и XHTTP-буферов rw-core "
+            "без активности не менее 5 минут."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION} by {AUTHOR}")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -658,6 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker_parser = subparsers.add_parser("_worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("--pid", type=int, required=True)
     worker_parser.add_argument("--config-json", required=True)
+    worker_parser.add_argument("--xhttp-json", default="[]")
     worker_parser.add_argument("--apply", action="store_true")
     return parser
 
@@ -669,7 +861,16 @@ def main() -> int:
             raw = json.loads(args.config_json)
             config = Config(**raw)
             config.validate()
-            print(json.dumps(worker(args.pid, config, args.apply), separators=(",", ":")))
+            raw_listeners = json.loads(args.xhttp_json)
+            if not isinstance(raw_listeners, list):
+                raise CleanerError("xhttp-json должен быть массивом")
+            xhttp_listeners = [XhttpListener(**item) for item in raw_listeners]
+            print(
+                json.dumps(
+                    worker(args.pid, config, args.apply, xhttp_listeners),
+                    separators=(",", ":"),
+                )
+            )
             return 0
 
         if args.command == "uninstall":

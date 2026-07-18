@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly APP_NAME="XHTTP Cleaner"
 readonly AUTHOR="Bankaev"
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly CLEANER="/usr/local/sbin/remnanode-xhttp-clean"
 readonly PROJECT_DIR="/opt/node-xhttp"
 readonly INSTALLER="$PROJECT_DIR/install.sh"
@@ -91,7 +91,8 @@ status_value() {
 
 draw_dashboard() {
     local cpu ram disk ram_pct ram_used ram_total disk_pct disk_used disk_total cores
-    local timer_active timer_enabled cleaner_status container image rss sockets stale idle ports
+    local timer_active timer_enabled cleaner_status container image rss sockets stale xhttp_stale idle ports
+    local xhttp_ports xhttp_discovery
     local last_result last_closed next_run cleaner_state cleaner_color
 
     cpu="$(cpu_percent)"
@@ -113,6 +114,9 @@ draw_dashboard() {
     rss="$(status_value xray_rss_mb "$cleaner_status")"
     sockets="$(status_value owned_tcp_sockets "$cleaner_status")"
     stale="$(status_value stale_outbound_sockets "$cleaner_status")"
+    xhttp_stale="$(status_value stale_xhttp_buffers "$cleaner_status")"
+    xhttp_ports="$(status_value xhttp_listeners "$cleaner_status")"
+    xhttp_discovery="$(status_value xhttp_discovery "$cleaner_status")"
     idle="$(status_value idle_seconds "$cleaner_status")"
     ports="$(status_value listening_ports "$cleaner_status")"
     last_result="$(systemctl show "$SERVICE" -p Result --value 2>/dev/null || true)"
@@ -131,7 +135,9 @@ draw_dashboard() {
     printf '%s║%s RemnaNode          : %-39s%s║%s\n' "$GOLD" "$RESET" "${container:-недоступен} ${image:-}" "$GOLD" "$RESET"
     printf '%s║%s Xray RSS           : %-39s%s║%s\n' "$GOLD" "$RESET" "${rss:-?} MiB" "$GOLD" "$RESET"
     printf '%s║%s TCP-сокеты Xray    : %-39s%s║%s\n' "$GOLD" "$RESET" "${sockets:-?}" "$GOLD" "$RESET"
-    printf '%s║%s Старше 5 минут     : %-39s%s║%s\n' "$GOLD" "$RESET" "${stale:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Старые outbound    : %-39s%s║%s\n' "$GOLD" "$RESET" "${stale:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Старые XHTTP буф.  : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_stale:-?}" "$GOLD" "$RESET"
+    printf '%s║%s XHTTP listeners    : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_ports:-нет} (${xhttp_discovery:-?})" "$GOLD" "$RESET"
     printf '%s║%s Listening-порты    : %-39s%s║%s\n' "$GOLD" "$RESET" "${ports:-?}" "$GOLD" "$RESET"
     printf '%s║%s Последняя очистка  : %-39s%s║%s\n' "$GOLD" "$RESET" "${last_result:-нет}; закрыто ${last_closed:-0}" "$GOLD" "$RESET"
     printf '%s║%s Следующий запуск   : %-39s%s║%s\n' "$GOLD" "$RESET" "${next_run:-не назначен}" "$GOLD" "$RESET"
