@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_ID = "xhttp-cleaner-v3"
+PATCH_ID = "xhttp-cleaner-v4"
 
 
 class PatchError(RuntimeError):
@@ -205,6 +205,21 @@ def patched_hub(source: str) -> str:
     )
     source = replace_once(
         source,
+        """\t\tl.server = http.Server{
+\t\t\tHandler:           handler,
+\t\t\tReadHeaderTimeout: time.Second * 4,
+\t\t\tMaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+""",
+        """\t\tl.server = http.Server{
+\t\t\tHandler:           handler,
+\t\t\tReadHeaderTimeout: time.Second * 4,
+\t\t\tIdleTimeout:       xhttpCleanerHTTPIdleTimeout,
+\t\t\tMaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
+""",
+        "XHTTP idle HTTP connection timeout",
+    )
+    source = replace_once(
+        source,
         """func (ln *Listener) Close() error {
 	if ln.h3server != nil {
 """,
@@ -300,23 +315,47 @@ def patched_upload_queue(source: str) -> str:
     return source
 
 
+def patched_default_policy(source: str) -> str:
+    return replace_once(
+        source,
+        """\t\tdefaultBufferSize = 512 * 1024
+""",
+        """\t\t// A 512 KiB queue per direction retains several GiB on busy
+\t\t// servers with thousands of sessions. 128 KiB preserves batching and
+\t\t// backpressure while bounding XHTTP, raw TCP and gRPC pipe memory.
+\t\tdefaultBufferSize = 128 * 1024
+""",
+        "default per-connection transport pipe budget",
+    )
+
+
 def patch_tree(root: Path, assets: Path) -> None:
     hub = root / "transport/internet/splithttp/hub.go"
     queue = root / "transport/internet/splithttp/upload_queue.go"
-    destination = root / "transport/internet/splithttp/xhttp_cleaner_reaper.go"
-    test_destination = root / "transport/internet/splithttp/xhttp_cleaner_reaper_test.go"
-    for path in (hub, queue):
+    default_policy = root / "features/policy/policy.go"
+    destinations = {
+        assets / "xhttp_cleaner_reaper.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper.go",
+        assets / "xhttp_cleaner_reaper_test.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper_test.go",
+        assets / "core_memory_optimizer.go": root / "main/xhttp_cleaner_memory_optimizer.go",
+        assets / "core_memory_optimizer_test.go": root / "main/xhttp_cleaner_memory_optimizer_test.go",
+    }
+    for path in (hub, queue, default_policy):
         if not path.is_file():
             raise PatchError(f"required Xray source file is missing: {path}")
-    if destination.exists() or test_destination.exists():
+    if any(path.exists() for path in destinations.values()):
         raise PatchError("tree already contains XHTTP Cleaner overlay")
 
-    originals = {hub: hub.read_text(encoding="utf-8"), queue: queue.read_text(encoding="utf-8")}
-    changes = {hub: patched_hub(originals[hub]), queue: patched_upload_queue(originals[queue])}
+    originals = {
+        path: path.read_text(encoding="utf-8")
+        for path in (hub, queue, default_policy)
+    }
+    changes = {
+        hub: patched_hub(originals[hub]),
+        queue: patched_upload_queue(originals[queue]),
+        default_policy: patched_default_policy(originals[default_policy]),
+    }
 
-    overlay = assets / "xhttp_cleaner_reaper.go"
-    overlay_test = assets / "xhttp_cleaner_reaper_test.go"
-    for path in (overlay, overlay_test):
+    for path in destinations:
         if not path.is_file():
             raise PatchError(f"patch asset is missing: {path}")
 
@@ -327,8 +366,8 @@ def patch_tree(root: Path, assets: Path) -> None:
             handle.write(content)
             temporary = Path(handle.name)
         temporary.replace(path)
-    shutil.copy2(overlay, destination)
-    shutil.copy2(overlay_test, test_destination)
+    for source, destination in destinations.items():
+        shutil.copy2(source, destination)
 
 
 def main() -> int:

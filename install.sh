@@ -106,7 +106,42 @@ detect_container() {
 
 write_initial_config() {
     if [[ -e "$CONFIG_FILE" ]]; then
-        log INFO "Существующая конфигурация сохранена: $CONFIG_FILE"
+        python3 - "$CONFIG_FILE" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    config = json.load(handle)
+
+# v3 scanned every ESTABLISHED socket and could terminate a valid idle TCP
+# bridge. Migrate only old configs which do not yet contain the v4 switch;
+# explicit v4 operator choices are preserved on reinstall.
+if "clean_established_outbound" not in config:
+    config["clean_established_outbound"] = False
+    config["clean_xhttp_buffers"] = False
+config.setdefault("clean_close_wait", True)
+
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=".remnanode-xhttp-clean.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o640)
+    os.replace(temporary, path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+        log INFO "Существующая конфигурация мигрирована/сохранена: $CONFIG_FILE"
         return 0
     fi
 
@@ -123,7 +158,9 @@ config = {
     "idle_seconds": 300,
     "include_inbound": False,
     "exclude_loopback": True,
-    "clean_xhttp_buffers": True,
+    "clean_xhttp_buffers": False,
+    "clean_close_wait": True,
+    "clean_established_outbound": False,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)
@@ -142,6 +179,8 @@ install_cleaner() {
     install -m 0755 "$XRAY_PATCH_SOURCE/patch_xray.py" "$XRAY_PATCH_INSTALLED/patch_xray.py"
     install -m 0644 "$XRAY_PATCH_SOURCE/xhttp_cleaner_reaper.go" "$XRAY_PATCH_INSTALLED/xhttp_cleaner_reaper.go"
     install -m 0644 "$XRAY_PATCH_SOURCE/xhttp_cleaner_reaper_test.go" "$XRAY_PATCH_INSTALLED/xhttp_cleaner_reaper_test.go"
+    install -m 0644 "$XRAY_PATCH_SOURCE/core_memory_optimizer.go" "$XRAY_PATCH_INSTALLED/core_memory_optimizer.go"
+    install -m 0644 "$XRAY_PATCH_SOURCE/core_memory_optimizer_test.go" "$XRAY_PATCH_INSTALLED/core_memory_optimizer_test.go"
     python3 "$CLEANER_SOURCE" install
     install -m 0755 "$MENU_SOURCE" "$MENU_INSTALLED"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, deploy and maintain the version-matched Xray XHTTP Cleaner fork."""
+"""Build, deploy and maintain the version-matched Xray memory-optimized fork."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-VERSION = "3.0.1"
-PATCH_ID = "xhttp-cleaner-v3"
+VERSION = "4.0.0"
+PATCH_ID = "xhttp-cleaner-v4"
+PATCH_MARKER_RE = re.compile(r"\bxhttp-cleaner-v\d+\b")
 DEFAULT_CONFIG = Path("/etc/remnanode-xhttp-clean.json")
 STATE_ROOT = Path("/var/lib/remnanode-xhttp-clean")
 CACHE_ROOT = Path("/var/cache/remnanode-xhttp-clean")
@@ -184,7 +185,13 @@ def preserved_container_settings(inspect_payload: str) -> dict[str, Any]:
 def installed_assets() -> Path:
     local = Path(__file__).resolve().parent / "xray_patch"
     assets = local if local.is_dir() else INSTALLED_ASSETS
-    required = (assets / "patch_xray.py", assets / "xhttp_cleaner_reaper.go")
+    required = (
+        assets / "patch_xray.py",
+        assets / "xhttp_cleaner_reaper.go",
+        assets / "xhttp_cleaner_reaper_test.go",
+        assets / "core_memory_optimizer.go",
+        assets / "core_memory_optimizer_test.go",
+    )
     if not all(path.is_file() for path in required):
         raise CoreManagerError(f"Xray patch assets are incomplete: {assets}")
     return assets
@@ -194,6 +201,8 @@ def current_info(container: str) -> dict[str, str]:
     binary = core_path(container)
     statement = version_statement(container, binary)
     goarch, arch_key = normalize_arch(docker(container, "exec", container, "uname", "-m"))
+    marker_match = PATCH_MARKER_RE.search(statement)
+    marker = marker_match.group(0) if marker_match else ""
     return {
         "binary": binary,
         "statement": statement,
@@ -201,6 +210,7 @@ def current_info(container: str) -> dict[str, str]:
         "goarch": goarch,
         "arch": arch_key,
         "patched": str(PATCH_ID in statement).lower(),
+        "cleaner_patch": marker,
         "container_id": docker(container, "inspect", "-f", "{{.Id}}", container),
     }
 
@@ -211,6 +221,15 @@ def version_dir(info: dict[str, str]) -> Path:
 
 def artifact_path(info: dict[str, str]) -> Path:
     return CACHE_ROOT / "artifacts" / PATCH_ID / f"{info['version']}-{info['arch']}" / "xray"
+
+
+def prune_project_build_cache(build_cache: Path) -> bool:
+    """Drop only the disposable Go build cache owned by this project."""
+    keep = os.environ.get("XHTTP_CLEANER_KEEP_BUILD_CACHE", "").strip().lower()
+    if keep in ("1", "true", "yes", "on"):
+        return False
+    shutil.rmtree(build_cache, ignore_errors=True)
+    return not build_cache.exists()
 
 
 def clone_and_build(info: dict[str, str], destination: Path) -> None:
@@ -251,12 +270,19 @@ def clone_and_build(info: dict[str, str], destination: Path) -> None:
              "transport/internet/splithttp/hub.go",
              "transport/internet/splithttp/upload_queue.go",
              "transport/internet/splithttp/xhttp_cleaner_reaper.go",
-             "transport/internet/splithttp/xhttp_cleaner_reaper_test.go"], capture=False, timeout=300)
+             "transport/internet/splithttp/xhttp_cleaner_reaper_test.go",
+             "features/policy/policy.go",
+             "main/xhttp_cleaner_memory_optimizer.go",
+             "main/xhttp_cleaner_memory_optimizer_test.go"], capture=False, timeout=300)
         run(["docker", "run", "--rm", *mounts, image, "go", "test",
              "./transport/internet/splithttp"], capture=False, timeout=900)
+        run(["docker", "run", "--rm", *mounts, image, "go", "test",
+             "./transport/internet/grpc", "./features/policy", "./main"], capture=False, timeout=900)
         run(["docker", "run", "--rm", *mounts, image, "go", "test", "-race",
              "-run", "^TestXHTTPCleaner", "./transport/internet/splithttp"],
             capture=False, timeout=900)
+        run(["docker", "run", "--rm", *mounts, image, "go", "test", "-race",
+             "-run", "^TestMemoryOptimizer", "./main"], capture=False, timeout=900)
         marker = f"{PATCH_ID}-{info['version']}"
         build_script = (
             f"CGO_ENABLED=0 GOOS=linux GOARCH={info['goarch']} "
@@ -287,6 +313,11 @@ def clone_and_build(info: dict[str, str], destination: Path) -> None:
                 "go_image": image,
             },
         )
+        # The compiler cache can exceed a gigabyte and is needed only while
+        # producing the artifact. Keep downloaded modules for future version
+        # gates, but release the project-owned build cache after success.
+        if prune_project_build_cache(build_cache):
+            print("core-build: disposable Go build cache removed", flush=True)
 
 
 def dump_runtime_config(container: str, destination: Path) -> None:
@@ -441,7 +472,7 @@ def stock_core_is_running(container: str) -> bool:
             return False
         info = current_info(container)
         process_ok = bool(running_core_evidence(container, info["binary"]))
-        return info["patched"] == "false" and process_ok
+        return not info["cleaner_patch"] and process_ok
     except (CoreManagerError, OSError):
         return False
 
@@ -472,7 +503,7 @@ def validate_inside_container(container: str, artifact: Path) -> str:
 def deploy(container: str, info: dict[str, str], artifact: Path) -> None:
     live = current_info(container)
     identity_fields = ("container_id", "version", "arch", "binary")
-    if any(live[field] != info[field] for field in identity_fields) or live["patched"] != "false":
+    if any(live[field] != info[field] for field in identity_fields) or live["cleaner_patch"]:
         raise CoreManagerError("container or Xray version changed while the fork was being built")
     directory = version_dir(info)
     directory.mkdir(parents=True, exist_ok=True)
@@ -556,6 +587,16 @@ def ensure(container: str, *, retry_failed: bool = False) -> str:
     if info["patched"] == "true":
         print(f"core-status: patched Xray {info['version']} ({PATCH_ID})")
         return "already-patched"
+    if info["cleaner_patch"]:
+        previous = info["cleaner_patch"]
+        print(
+            f"core-upgrade: restoring stock Xray before replacing legacy patch {previous}",
+            flush=True,
+        )
+        rollback(container)
+        info = current_info(container)
+        if info["cleaner_patch"]:
+            raise CoreManagerError("legacy Cleaner patch is still active after rollback")
     artifact = artifact_path(info)
     failure = STATE_ROOT / "failures" / f"{PATCH_ID}-{info['version']}-{info['arch']}.json"
     if failure.exists() and not retry_failed:
@@ -609,7 +650,7 @@ def rollback(container: str) -> None:
 def restore_if_patched(container: str) -> None:
     require_environment(container)
     info = current_info(container)
-    if info["patched"] != "true":
+    if not info["cleaner_patch"]:
         print("core-restore: current Xray is already the original stock build")
         return
     rollback(container)
@@ -626,6 +667,7 @@ def print_status(container: str) -> None:
     print(f"core_arch={info['arch']}")
     print(f"core_patch_id={PATCH_ID}")
     print(f"core_patched={info['patched']}")
+    print(f"core_detected_patch={info['cleaner_patch'] or 'stock'}")
     print(f"core_process_running={str(bool(running_core_evidence(container, info['binary']))).lower()}")
     print(f"core_artifact_cached={str(artifact.is_file()).lower()}")
 

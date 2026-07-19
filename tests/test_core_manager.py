@@ -1,8 +1,10 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,9 +16,14 @@ SPEC.loader.exec_module(manager)
 
 class CoreManagerTests(unittest.TestCase):
     def test_parse_xray_version_and_marker(self):
-        statement = "Xray 26.6.27 (Xray, Penetrates Everything.) xhttp-cleaner-v3-26.6.27 (go1.26 linux/amd64)"
+        statement = "Xray 26.6.27 (Xray, Penetrates Everything.) xhttp-cleaner-v4-26.6.27 (go1.26 linux/amd64)"
         self.assertEqual(manager.parse_version(statement), "26.6.27")
         self.assertIn(manager.PATCH_ID, statement)
+
+    def test_legacy_patch_marker_is_detected_for_safe_upgrade(self):
+        match = manager.PATCH_MARKER_RE.search("build xhttp-cleaner-v3-26.6.27")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(0), "xhttp-cleaner-v3")
 
     def test_parse_version_rejects_unexpected_output(self):
         with self.assertRaises(manager.CoreManagerError):
@@ -42,6 +49,23 @@ class CoreManagerTests(unittest.TestCase):
         path = manager.artifact_path(info)
         self.assertIn("26.6.27-amd64", str(path))
         self.assertIn(manager.PATCH_ID, str(path))
+
+    def test_project_build_cache_is_pruned_unless_operator_keeps_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "go-build"
+            cache.mkdir()
+            (cache / "large-entry").write_bytes(b"cache")
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("XHTTP_CLEANER_KEEP_BUILD_CACHE", None)
+                self.assertTrue(manager.prune_project_build_cache(cache))
+            self.assertFalse(cache.exists())
+
+            cache.mkdir()
+            with mock.patch.dict(
+                os.environ, {"XHTTP_CLEANER_KEEP_BUILD_CACHE": "true"}
+            ):
+                self.assertFalse(manager.prune_project_build_cache(cache))
+            self.assertTrue(cache.exists())
 
     def test_settings_fingerprint_ignores_runtime_state(self):
         base = [{

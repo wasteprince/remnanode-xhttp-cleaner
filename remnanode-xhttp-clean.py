@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove stale outbound and XHTTP TCP sockets owned by RemnaNode's rw-core."""
+"""Maintain the RemnaNode Xray memory fork and safely reap dead TCP sockets."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "3.0.1"
+VERSION = "4.0.0"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))
@@ -67,7 +67,9 @@ class Config:
     idle_seconds: int = 300
     include_inbound: bool = False
     exclude_loopback: bool = True
-    clean_xhttp_buffers: bool = True
+    clean_xhttp_buffers: bool = False
+    clean_close_wait: bool = True
+    clean_established_outbound: bool = False
 
     @classmethod
     def load(cls) -> "Config":
@@ -94,10 +96,17 @@ class Config:
             raise CleanerError("idle_seconds должен быть целым числом")
         if self.idle_seconds < 300:
             raise CleanerError("idle_seconds нельзя устанавливать меньше 300 секунд")
-        boolean_fields = (self.include_inbound, self.exclude_loopback, self.clean_xhttp_buffers)
+        boolean_fields = (
+            self.include_inbound,
+            self.exclude_loopback,
+            self.clean_xhttp_buffers,
+            self.clean_close_wait,
+            self.clean_established_outbound,
+        )
         if not all(isinstance(value, bool) for value in boolean_fields):
             raise CleanerError(
-                "include_inbound, exclude_loopback и clean_xhttp_buffers должны быть boolean"
+                "include_inbound, exclude_loopback, clean_xhttp_buffers, "
+                "clean_close_wait и clean_established_outbound должны быть boolean"
             )
 
 
@@ -443,6 +452,15 @@ def candidate_kind(
 ) -> Optional[str]:
     if record.state not in TARGET_STATES or record.inode not in owned_inodes:
         return None
+    idle_ms = record.idle_ms
+    if idle_ms is None or idle_ms < config.idle_seconds * 1000:
+        return None
+
+    # CLOSE_WAIT means that the peer has already closed its side. Keeping such
+    # an fd cannot preserve a bridge; after the idle guard it is safe to reap.
+    if record.state == TCP_CLOSE_WAIT:
+        return "CLOSE-WAIT" if config.clean_close_wait else None
+
     xhttp_listener = matching_xhttp_listener(record, xhttp_listeners)
     is_xhttp = xhttp_listener is not None and config.clean_xhttp_buffers
     if record.local_port in listen_ports:
@@ -453,15 +471,17 @@ def candidate_kind(
         else:
             return None
     else:
+        # An ESTABLISHED raw TCP connection may be an intentionally idle,
+        # long-lived bridge between servers. It is protected by default even
+        # after five minutes; Xray's payload activity timer owns its lifetime.
+        if not config.clean_established_outbound:
+            return None
         kind = "OUTBOUND"
     # A recognized XHTTP listener may intentionally be loopback-only behind a
     # reverse proxy. Other loopback traffic remains protected by the old rule.
     if config.exclude_loopback and kind != "XHTTP-BUFFER" and (
         is_loopback(record.local_address) or is_loopback(record.remote_address)
     ):
-        return None
-    idle_ms = record.idle_ms
-    if idle_ms is None or idle_ms < config.idle_seconds * 1000:
         return None
     return kind
 
@@ -480,8 +500,19 @@ def candidate_reason(
     return f"нет передачи данных {idle_ms // 1000} с"
 
 
-def dump_all(client: DiagClient) -> List[SocketRecord]:
-    states = (*TARGET_STATES, TCP_LISTEN)
+def diagnostic_states(config: Config) -> Tuple[int, ...]:
+    states: List[int] = []
+    if config.clean_close_wait:
+        states.append(TCP_CLOSE_WAIT)
+    if config.clean_xhttp_buffers or config.clean_established_outbound or config.include_inbound:
+        states.extend((TCP_ESTABLISHED, TCP_LISTEN))
+    return tuple(dict.fromkeys(states))
+
+
+def dump_all(client: DiagClient, config: Config) -> List[SocketRecord]:
+    states = diagnostic_states(config)
+    if not states:
+        return []
     records: List[SocketRecord] = []
     for family in (socket.AF_INET, socket.AF_INET6):
         records.extend(client.dump(states, family))
@@ -496,7 +527,7 @@ def worker(
 ) -> Dict[str, object]:
     owned_before = owned_socket_inodes(pid)
     with DiagClient() as client:
-        records = dump_all(client)
+        records = dump_all(client, config)
         listen_ports = {
             item.local_port
             for item in records
@@ -637,6 +668,64 @@ def discover_xhttp_listeners(config: Config) -> Tuple[List[XhttpListener], str]:
     return [], "unavailable"
 
 
+def parse_transport_counts(raw_config: object) -> Dict[str, int]:
+    counts = {"xhttp": 0, "tcp": 0, "grpc": 0}
+    if not isinstance(raw_config, dict):
+        return counts
+    for section in ("inbounds", "outbounds"):
+        entries = raw_config.get(section, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            stream = entry.get("streamSettings", {})
+            if not isinstance(stream, dict):
+                continue
+            network = str(stream.get("network", "")).lower()
+            if network in ("xhttp", "splithttp"):
+                counts["xhttp"] += 1
+            elif network == "grpc":
+                counts["grpc"] += 1
+            elif network in ("tcp", "raw"):
+                counts["tcp"] += 1
+    return counts
+
+
+def discover_transport_counts(config: Config) -> Tuple[Dict[str, int], str]:
+    attempts = (
+        ["docker", "exec", config.container, "cli", "--dump-config-raw"],
+        ["docker", "exec", config.container, "cli", "-D"],
+    )
+    for command in attempts:
+        completed = run(command, check=False)
+        if completed.returncode != 0 or not completed.stdout.strip():
+            continue
+        output = completed.stdout.strip()
+        first, last = output.find("{"), output.rfind("}")
+        if first < 0 or last <= first:
+            continue
+        try:
+            return parse_transport_counts(json.loads(output[first : last + 1])), "ok"
+        except json.JSONDecodeError:
+            continue
+    return {"xhttp": 0, "tcp": 0, "grpc": 0}, "unavailable"
+
+
+def read_memory_optimizer_status(config: Config) -> Dict[str, object]:
+    completed = run(
+        ["docker", "exec", config.container, "cat", "/tmp/xray-memory-optimizer.json"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {}
+    try:
+        status = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return status if isinstance(status, dict) else {}
+
+
 def run_worker(config: Config, apply: bool) -> Dict[str, object]:
     require_root()
     if shutil.which("nsenter") is None:
@@ -682,6 +771,34 @@ def process_rss_mb(pid: int) -> int:
     return 0
 
 
+def process_cpu_ticks(stat_line: str) -> int:
+    """Parse utime+stime while allowing spaces and parentheses in comm."""
+    close = stat_line.rfind(")")
+    if close < 0:
+        raise ValueError("malformed /proc stat")
+    fields = stat_line[close + 1 :].split()
+    if len(fields) <= 12:
+        raise ValueError("short /proc stat")
+    return int(fields[11]) + int(fields[12])
+
+
+def process_cpu_percent(pid: int, sample_seconds: float = 0.20) -> float:
+    """Return current Xray CPU usage where 100% means one logical CPU."""
+    try:
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+        path = Path(f"/proc/{pid}/stat")
+        first = process_cpu_ticks(path.read_text(encoding="utf-8"))
+        started = time.monotonic()
+        time.sleep(sample_seconds)
+        second = process_cpu_ticks(path.read_text(encoding="utf-8"))
+        elapsed = time.monotonic() - started
+        if ticks_per_second <= 0 or elapsed <= 0 or second < first:
+            return 0.0
+        return (second - first) * 100.0 / ticks_per_second / elapsed
+    except (OSError, ValueError):
+        return 0.0
+
+
 def print_records(records: Sequence[Dict[str, object]]) -> None:
     if not records:
         print("Подходящих неактивных TCP-сокетов нет.")
@@ -705,16 +822,32 @@ def print_records(records: Sequence[Dict[str, object]]) -> None:
 def command_status(config: Config) -> None:
     _init_pid, xray_pid, image = docker_info(config)
     result = run_worker(config, apply=False)
+    transports, transport_discovery = discover_transport_counts(config)
+    memory = read_memory_optimizer_status(config)
     print(f"container={config.container}")
     print(f"image={image}")
     print(f"xray_pid={xray_pid}")
     print(f"xray_rss_mb={process_rss_mb(xray_pid)}")
+    print(f"xray_cpu_percent={process_cpu_percent(xray_pid):.1f}")
     print(f"owned_tcp_sockets={result['owned_sockets']}")
     candidates = result["candidates"]
     stale_outbound = sum(1 for item in candidates if item["kind"] == "OUTBOUND")
     stale_xhttp = sum(1 for item in candidates if item["kind"] == "XHTTP-BUFFER")
+    stale_close_wait = sum(1 for item in candidates if item["kind"] == "CLOSE-WAIT")
     print(f"stale_outbound_sockets={stale_outbound}")
     print(f"stale_xhttp_sockets={stale_xhttp}")
+    print(f"stale_close_wait_sockets={stale_close_wait}")
+    print(f"preserve_established_outbound={str(not config.clean_established_outbound).lower()}")
+    print(f"transport_xhttp={transports['xhttp']}")
+    print(f"transport_tcp={transports['tcp']}")
+    print(f"transport_grpc={transports['grpc']}")
+    print(f"transport_discovery={transport_discovery}")
+    print(f"memory_optimizer_enabled={str(bool(memory.get('enabled'))).lower()}")
+    print(f"memory_optimizer_limit_mb={int(memory.get('go_memory_limit_bytes', 0) or 0) // (1024 * 1024)}")
+    print(f"memory_optimizer_runtime_mb={int(memory.get('runtime_in_use_bytes', 0) or 0) // (1024 * 1024)}")
+    print(f"memory_optimizer_runs={int(memory.get('forced_runs', 0) or 0)}")
+    print(f"memory_optimizer_last_reclaimed_mb={int(memory.get('last_reclaimed_bytes', 0) or 0) // (1024 * 1024)}")
+    print(f"memory_optimizer_updated_at={memory.get('updated_at', '')}")
     print(f"xhttp_listeners={','.join(result['xhttp_listeners'])}")
     print(f"xhttp_discovery={result['xhttp_discovery']}")
     print(f"idle_seconds={config.idle_seconds}")
@@ -736,10 +869,12 @@ def command_clean(config: Config, dry_run: bool) -> None:
         return
     xhttp_closed = sum(1 for item in closed if item["kind"] == "XHTTP-BUFFER")
     outbound_closed = sum(1 for item in closed if item["kind"] == "OUTBOUND")
+    close_wait_closed = sum(1 for item in closed if item["kind"] == "CLOSE-WAIT")
     print(f"Найдено перед повторной проверкой: {len(candidates)}")
     print(f"Закрыто по inode + kernel cookie: {len(closed)}")
     print(f"Закрыто старых XHTTP TCP-сокетов: {xhttp_closed}")
     print(f"Закрыто старых исходящих сокетов: {outbound_closed}")
+    print(f"Закрыто зависших CLOSE-WAIT: {close_wait_closed}")
     print(f"Пропущено как изменившиеся/активные: {result['skipped_changed']}")
     print_records(closed)  # type: ignore[arg-type]
 
@@ -783,7 +918,7 @@ def command_install(config: Config) -> None:
     atomic_write(
         SERVICE_PATH,
         """[Unit]
-Description=XHTTP Cleaner by Bankaev - maintain patched Xray and clean stale rw-core sockets
+Description=Xray Memory Optimizer by Bankaev - maintain fork and reap dead rw-core sockets
 After=docker.service
 Requires=docker.service
 
@@ -815,8 +950,8 @@ WantedBy=timers.target
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", "--now", "remnanode-xhttp-clean.timer"])
     print(
-        f"Установлено. Форк Xray и TCP-сокеты без данных >= {config.idle_seconds} с "
-        "будут проверяться каждые 5 минут."
+        f"Установлено. Форк Xray и закрытые peer-сокеты без данных >= {config.idle_seconds} с "
+        "будут обслуживаться каждые 5 минут; активные TCP/gRPC соединения защищены."
     )
 
 

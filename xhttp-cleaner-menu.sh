@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 readonly APP_NAME="XHTTP Cleaner"
 readonly AUTHOR="Bankaev"
-readonly VERSION="3.0.1"
+readonly VERSION="4.0.0"
 readonly CLEANER="/usr/local/sbin/remnanode-xhttp-clean"
 readonly CORE_MANAGER="/usr/local/lib/remnanode-xhttp-clean/xray-core-manager"
 readonly PROJECT_DIR="/opt/node-xhttp"
@@ -92,8 +92,9 @@ status_value() {
 
 draw_dashboard() {
     local cpu ram disk ram_pct ram_used ram_total disk_pct disk_used disk_total cores
-    local timer_active timer_enabled cleaner_status container image rss sockets stale xhttp_stale idle ports
+    local timer_active timer_enabled cleaner_status container image rss xray_cpu sockets stale xhttp_stale close_wait preserve_established idle ports
     local xhttp_ports xhttp_discovery core_status core_version core_patched
+    local tcp_transports grpc_transports memory_enabled memory_runtime memory_limit memory_runs memory_reclaimed
     local last_result last_closed next_run cleaner_state cleaner_color
 
     cpu="$(cpu_percent)"
@@ -114,12 +115,22 @@ draw_dashboard() {
     container="$(status_value container "$cleaner_status")"
     image="$(status_value image "$cleaner_status")"
     rss="$(status_value xray_rss_mb "$cleaner_status")"
+    xray_cpu="$(status_value xray_cpu_percent "$cleaner_status")"
     sockets="$(status_value owned_tcp_sockets "$cleaner_status")"
     stale="$(status_value stale_outbound_sockets "$cleaner_status")"
     xhttp_stale="$(status_value stale_xhttp_sockets "$cleaner_status")"
+    close_wait="$(status_value stale_close_wait_sockets "$cleaner_status")"
+    preserve_established="$(status_value preserve_established_outbound "$cleaner_status")"
     xhttp_ports="$(status_value xhttp_listeners "$cleaner_status")"
     xhttp_discovery="$(status_value xhttp_discovery "$cleaner_status")"
     idle="$(status_value idle_seconds "$cleaner_status")"
+    tcp_transports="$(status_value transport_tcp "$cleaner_status")"
+    grpc_transports="$(status_value transport_grpc "$cleaner_status")"
+    memory_enabled="$(status_value memory_optimizer_enabled "$cleaner_status")"
+    memory_runtime="$(status_value memory_optimizer_runtime_mb "$cleaner_status")"
+    memory_limit="$(status_value memory_optimizer_limit_mb "$cleaner_status")"
+    memory_runs="$(status_value memory_optimizer_runs "$cleaner_status")"
+    memory_reclaimed="$(status_value memory_optimizer_last_reclaimed_mb "$cleaner_status")"
     ports="$(status_value listening_ports "$cleaner_status")"
     core_version="$(status_value core_version "$core_status")"
     core_patched="$(status_value core_patched "$core_status")"
@@ -139,9 +150,15 @@ draw_dashboard() {
     printf '%s║%s RemnaNode          : %-39s%s║%s\n' "$GOLD" "$RESET" "${container:-недоступен} ${image:-}" "$GOLD" "$RESET"
     printf '%s║%s Xray Core Fork     : %-39s%s║%s\n' "$GOLD" "$RESET" "v${core_version:-?}; patched=${core_patched:-?}" "$GOLD" "$RESET"
     printf '%s║%s Xray RSS           : %-39s%s║%s\n' "$GOLD" "$RESET" "${rss:-?} MiB" "$GOLD" "$RESET"
+    printf '%s║%s Xray CPU           : %-39s%s║%s\n' "$GOLD" "$RESET" "${xray_cpu:-?}% (100% = 1 vCore)" "$GOLD" "$RESET"
     printf '%s║%s TCP-сокеты Xray    : %-39s%s║%s\n' "$GOLD" "$RESET" "${sockets:-?}" "$GOLD" "$RESET"
     printf '%s║%s Старые outbound    : %-39s%s║%s\n' "$GOLD" "$RESET" "${stale:-?}" "$GOLD" "$RESET"
     printf '%s║%s Старые XHTTP TCP   : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_stale:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Зависшие CLOSE-WAIT: %-39s%s║%s\n' "$GOLD" "$RESET" "${close_wait:-?}" "$GOLD" "$RESET"
+    printf '%s║%s ESTABLISHED защита : %-39s%s║%s\n' "$GOLD" "$RESET" "${preserve_established:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Транспорты TCP/gRPC: %-39s%s║%s\n' "$GOLD" "$RESET" "${tcp_transports:-?} / ${grpc_transports:-?}" "$GOLD" "$RESET"
+    printf '%s║%s Memory optimizer   : %-39s%s║%s\n' "$GOLD" "$RESET" "${memory_enabled:-?}; ${memory_runtime:-?}/${memory_limit:-?} MiB" "$GOLD" "$RESET"
+    printf '%s║%s GC/reclaim         : %-39s%s║%s\n' "$GOLD" "$RESET" "циклов ${memory_runs:-0}; последний ${memory_reclaimed:-0} MiB" "$GOLD" "$RESET"
     printf '%s║%s XHTTP listeners    : %-39s%s║%s\n' "$GOLD" "$RESET" "${xhttp_ports:-нет} (${xhttp_discovery:-?})" "$GOLD" "$RESET"
     printf '%s║%s Listening-порты    : %-39s%s║%s\n' "$GOLD" "$RESET" "${ports:-?}" "$GOLD" "$RESET"
     printf '%s║%s Последняя очистка  : %-39s%s║%s\n' "$GOLD" "$RESET" "${last_result:-нет}; закрыто ${last_closed:-0}" "$GOLD" "$RESET"

@@ -43,13 +43,47 @@ def record(
 
 class CandidateTests(unittest.TestCase):
     def setUp(self):
-        self.config = MODULE.Config(idle_seconds=300)
+        self.config = MODULE.Config(
+            idle_seconds=300,
+            clean_xhttp_buffers=True,
+            clean_established_outbound=True,
+        )
 
     def reason(self, item, listen_ports=None):
         return MODULE.candidate_reason(item, {42}, listen_ports or set(), self.config)
 
     def test_exactly_five_minutes_is_stale(self):
         self.assertIsNotNone(self.reason(record(idle_ms=300_000)))
+
+    def test_established_outbound_is_protected_by_default_for_tcp_bridges(self):
+        config = MODULE.Config(idle_seconds=300)
+        self.assertIsNone(
+            MODULE.candidate_kind(record(idle_ms=3_600_000), {42}, set(), config)
+        )
+
+    def test_close_wait_is_reaped_without_enabling_established_cleanup(self):
+        item = MODULE.dataclasses.replace(record(), state=MODULE.TCP_CLOSE_WAIT)
+        config = MODULE.Config(idle_seconds=300)
+        self.assertEqual(
+            MODULE.candidate_kind(item, {42}, set(), config), "CLOSE-WAIT"
+        )
+
+    def test_close_wait_cleanup_can_be_disabled(self):
+        item = MODULE.dataclasses.replace(record(), state=MODULE.TCP_CLOSE_WAIT)
+        config = MODULE.Config(idle_seconds=300, clean_close_wait=False)
+        self.assertIsNone(MODULE.candidate_kind(item, {42}, set(), config))
+
+    def test_default_diagnostic_dump_does_not_request_established_sockets(self):
+        self.assertEqual(
+            MODULE.diagnostic_states(MODULE.Config()), (MODULE.TCP_CLOSE_WAIT,)
+        )
+
+    def test_established_dump_is_opt_in(self):
+        states = MODULE.diagnostic_states(
+            MODULE.Config(clean_established_outbound=True)
+        )
+        self.assertIn(MODULE.TCP_ESTABLISHED, states)
+        self.assertIn(MODULE.TCP_LISTEN, states)
 
     def test_less_than_five_minutes_is_active(self):
         self.assertIsNone(self.reason(record(idle_ms=299_999)))
@@ -116,6 +150,14 @@ class WireFormatTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("=II", payload, 48), cookie)
 
 
+class ProcessMetricTests(unittest.TestCase):
+    def test_proc_stat_parser_handles_spaces_and_parentheses_in_name(self):
+        # Fields after comm begin with state (field 3); utime/stime are 14/15.
+        tail = ["S"] + ["0"] * 10 + ["120", "30"] + ["0"] * 8
+        line = "42 (rw core (worker)) " + " ".join(tail)
+        self.assertEqual(MODULE.process_cpu_ticks(line), 150)
+
+
 class XhttpConfigTests(unittest.TestCase):
     def test_extracts_xhttp_and_legacy_splithttp_only(self):
         listeners = MODULE.parse_xhttp_listeners(
@@ -161,6 +203,21 @@ class XhttpConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(listeners, [])
+
+    def test_counts_xhttp_tcp_and_grpc_in_both_directions(self):
+        counts = MODULE.parse_transport_counts(
+            {
+                "inbounds": [
+                    {"streamSettings": {"network": "xhttp"}},
+                    {"streamSettings": {"network": "grpc"}},
+                ],
+                "outbounds": [
+                    {"streamSettings": {"network": "raw"}},
+                    {"streamSettings": {"network": "splithttp"}},
+                ],
+            }
+        )
+        self.assertEqual(counts, {"xhttp": 2, "tcp": 1, "grpc": 1})
 
 
 if __name__ == "__main__":

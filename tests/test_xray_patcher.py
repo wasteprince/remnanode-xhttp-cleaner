@@ -64,6 +64,10 @@ type Listener struct {
 \t\tsessions:       sync.Map{},
 \t\tsocketSettings: streamSettings.SocketSettings,
 \t}
+\t\tl.server = http.Server{
+\t\t\tHandler:           handler,
+\t\t\tReadHeaderTimeout: time.Second * 4,
+\t\t\tMaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 
 \treturn l, err
 }
@@ -94,6 +98,11 @@ func (h *uploadQueue) Push(p Packet) error {
 """
 
 
+POLICY_FIXTURE = """package policy
+\t\tdefaultBufferSize = 512 * 1024
+"""
+
+
 class PatcherTests(unittest.TestCase):
     def test_current_structural_contract_is_patched(self):
         hub = patch_xray.patched_hub(HUB_FIXTURE)
@@ -103,7 +112,10 @@ class PatcherTests(unittest.TestCase):
         self.assertIn("handler.startXHTTPReaper()", hub)
         self.assertIn("xhttpSessionTouch(currentSession)", hub)
         self.assertIn("CompareAndDelete(sessionId, currentSession)", hub)
+        self.assertIn("IdleTimeout:       xhttpCleanerHTTPIdleTimeout", hub)
         self.assertIn("touchActivity", queue)
+        policy = patch_xray.patched_default_policy(POLICY_FIXTURE)
+        self.assertIn("defaultBufferSize = 128 * 1024", policy)
 
     def test_changed_upstream_fails_closed(self):
         with self.assertRaises(patch_xray.PatchError):
@@ -114,10 +126,14 @@ class PatcherTests(unittest.TestCase):
             root = Path(temporary)
             package = root / "transport/internet/splithttp"
             package.mkdir(parents=True)
+            policy_package = root / "features/policy"
+            policy_package.mkdir(parents=True)
             hub = package / "hub.go"
             queue = package / "upload_queue.go"
+            policy = policy_package / "policy.go"
             hub.write_text(HUB_FIXTURE, encoding="utf-8")
             queue.write_text("incompatible", encoding="utf-8")
+            policy.write_text(POLICY_FIXTURE, encoding="utf-8")
             before = hub.read_text(encoding="utf-8")
             with self.assertRaises(patch_xray.PatchError):
                 patch_xray.patch_tree(root, ROOT / "xray_patch")

@@ -5,7 +5,6 @@ package splithttp
 // upload_queue.go feed this reaper with real payload activity.
 
 import (
-	"runtime/debug"
 	"sync/atomic"
 	"time"
 )
@@ -14,7 +13,9 @@ const (
 	xhttpCleanerIdleTTL       = 5 * time.Minute
 	xhttpCleanerCheckInterval = 5 * time.Minute
 	xhttpCleanerPreconnectTTL = 30 * time.Second
-	xhttpCleanerReleaseDelay  = 2 * time.Second
+	// net/http applies IdleTimeout only while waiting for the next request. A
+	// long-running XHTTP stream remains active and is not interrupted by it.
+	xhttpCleanerHTTPIdleTimeout = 5 * time.Minute
 )
 
 type xhttpSessionActivity struct {
@@ -88,9 +89,7 @@ func (h *requestHandler) startXHTTPPreconnectExpiry(sessionID string, session *h
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			if h.expireUnconnectedXHTTPSession(sessionID, session) {
-				requestXHTTPMemoryRelease()
-			}
+			h.expireUnconnectedXHTTPSession(sessionID, session)
 		case <-session.isFullyConnected.Wait():
 		case <-session.uploadQueue.closed.Wait():
 		case <-h.reaperStop.Wait():
@@ -107,18 +106,14 @@ func (h *requestHandler) startXHTTPReaper() {
 		for {
 			select {
 			case now := <-ticker.C:
-				reaped := false
 				h.sessions.Range(func(key, value any) bool {
 					sessionID, idOK := key.(string)
 					session, sessionOK := value.(*httpSession)
-					if idOK && sessionOK && h.reapXHTTPSessionIfIdle(sessionID, session, now) {
-						reaped = true
+					if idOK && sessionOK {
+						h.reapXHTTPSessionIfIdle(sessionID, session, now)
 					}
 					return true
 				})
-				if reaped {
-					requestXHTTPMemoryRelease()
-				}
 			case <-h.reaperStop.Wait():
 				return
 			}
@@ -131,39 +126,12 @@ func (h *requestHandler) stopXHTTPReaper() {
 		return
 	}
 	_ = h.reaperStop.Close()
-	reaped := false
 	h.sessions.Range(func(key, value any) bool {
 		sessionID, idOK := key.(string)
 		session, sessionOK := value.(*httpSession)
 		if idOK && sessionOK && h.sessions.CompareAndDelete(sessionID, session) {
 			_ = session.uploadQueue.Close()
-			reaped = true
 		}
 		return true
 	})
-	if reaped {
-		requestXHTTPMemoryRelease()
-	}
-}
-
-var lastXHTTPMemoryRelease atomic.Int64
-
-// FreeOSMemory is intentionally throttled.  Closing the queue first makes all
-// of its payload slices unreachable when the handler unwinds; the short delay
-// lets that happen before Go returns free pages to the operating system.
-func requestXHTTPMemoryRelease() {
-	now := time.Now().UnixNano()
-	for {
-		previous := lastXHTTPMemoryRelease.Load()
-		if previous != 0 && now-previous < int64(xhttpCleanerCheckInterval) {
-			return
-		}
-		if lastXHTTPMemoryRelease.CompareAndSwap(previous, now) {
-			go func() {
-				time.Sleep(xhttpCleanerReleaseDelay)
-				debug.FreeOSMemory()
-			}()
-			return
-		}
-	}
 }
