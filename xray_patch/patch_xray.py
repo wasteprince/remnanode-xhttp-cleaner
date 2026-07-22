@@ -316,17 +316,34 @@ def patched_upload_queue(source: str) -> str:
 
 
 def patched_default_policy(source: str) -> str:
-    return replace_once(
-        source,
-        """\t\tdefaultBufferSize = 512 * 1024
+    variants = (
+        (
+            """\t\tdefaultBufferSize = 512 * 1024
 """,
-        """\t\t// A 512 KiB queue per direction retains several GiB on busy
+            """\t\t// A 512 KiB queue per direction retains several GiB on busy
 \t\t// servers with thousands of sessions. 128 KiB preserves batching and
 \t\t// backpressure while bounding XHTTP, raw TCP and gRPC pipe memory.
 \t\tdefaultBufferSize = 128 * 1024
 """,
-        "default per-connection transport pipe budget",
+        ),
+        (
+            """\t\t\treturn 512 * 1024
+""",
+            """\t\t\t// Bound the default XHTTP, raw TCP and gRPC pipe memory
+\t\t\t// while preserving Xray's reloadable atomic policy in v26.7+.
+\t\t\treturn 128 * 1024
+""",
+        ),
     )
+    matches = [(old, new, source.count(old)) for old, new in variants if source.count(old)]
+    total = sum(count for _old, _new, count in matches)
+    if total != 1:
+        raise PatchError(
+            "default per-connection transport pipe budget: "
+            f"expected one supported structural match, found {total}"
+        )
+    old, new, _count = matches[0]
+    return source.replace(old, new, 1)
 
 
 def patch_tree(root: Path, assets: Path) -> None:

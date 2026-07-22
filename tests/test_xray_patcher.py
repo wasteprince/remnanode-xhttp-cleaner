@@ -103,6 +103,15 @@ POLICY_FIXTURE = """package policy
 """
 
 
+POLICY_FIXTURE_26_7 = """package policy
+var defaultBufferSize atomic.Int32
+func readDefaultBufferSize() int32 {
+\t\tdefault:
+\t\t\treturn 512 * 1024
+}
+"""
+
+
 class PatcherTests(unittest.TestCase):
     def test_current_structural_contract_is_patched(self):
         hub = patch_xray.patched_hub(HUB_FIXTURE)
@@ -116,6 +125,16 @@ class PatcherTests(unittest.TestCase):
         self.assertIn("touchActivity", queue)
         policy = patch_xray.patched_default_policy(POLICY_FIXTURE)
         self.assertIn("defaultBufferSize = 128 * 1024", policy)
+
+    def test_reloadable_v26_7_policy_is_patched_without_removing_atomic_storage(self):
+        policy = patch_xray.patched_default_policy(POLICY_FIXTURE_26_7)
+        self.assertIn("var defaultBufferSize atomic.Int32", policy)
+        self.assertIn("return 128 * 1024", policy)
+        self.assertNotIn("return 512 * 1024", policy)
+
+    def test_multiple_supported_policy_anchors_fail_closed(self):
+        with self.assertRaises(patch_xray.PatchError):
+            patch_xray.patched_default_policy(POLICY_FIXTURE + POLICY_FIXTURE_26_7)
 
     def test_changed_upstream_fails_closed(self):
         with self.assertRaises(patch_xray.PatchError):

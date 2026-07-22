@@ -5,7 +5,7 @@
 > **Автор не несёт ответственности за крупную утечку памяти на клиенте, если пользователь не выполнил приведённые ниже рекомендации для настроек хоста Remnawave.** Серверный форк не может принудительно исправить параметры уже настроенных клиентских подключений.
 
 > [!WARNING]
-> **Скрипт предназначен только для Xray 26.6.x и более новых версий.** Старые ядра, включая `v26.3.27`, имеют другую внутреннюю реализацию XHTTP `uploadQueue` и не поддерживаются. Для каждой новой версии всё равно выполняется compatibility gate: если структуры Xray изменились, установка безопасно остановится без применения несовместимого патча.
+> **Скрипт предназначен только для Xray 26.6.x и более новых версий.** Полный цикл patch/tests/race/build подтверждён для `v26.6.27` и `v26.7.11`. Старые ядра, включая `v26.3.27`, имеют другую внутреннюю реализацию XHTTP `uploadQueue` и не поддерживаются. Для каждой новой версии всё равно выполняется compatibility gate: если структуры Xray изменились, установка безопасно остановится без применения несовместимого патча.
 
 <div align="center">
 
@@ -365,6 +365,7 @@ xhttp-cleaner uninstall
 - [Xray gRPC transport](https://xtls.github.io/config/transports/grpc.html)
 - [Xray-core v26.6.27 XHTTP handler](https://github.com/XTLS/Xray-core/blob/v26.6.27/transport/internet/splithttp/hub.go)
 - [Xray-core v26.6.27 default policy](https://github.com/XTLS/Xray-core/blob/v26.6.27/features/policy/policy.go)
+- [Xray-core v26.7.11 reloadable default policy](https://github.com/XTLS/Xray-core/blob/v26.7.11/features/policy/policy.go)
 - [Go GC guide: soft memory limit и RSS model](https://go.dev/doc/gc-guide)
 - [Go runtime/debug](https://pkg.go.dev/runtime/debug)
 - [grpc-go server buffer/window options](https://pkg.go.dev/google.golang.org/grpc)
