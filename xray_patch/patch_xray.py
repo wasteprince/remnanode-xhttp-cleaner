@@ -30,6 +30,15 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def replace_one_variant(text: str, variants: tuple[tuple[str, str], ...], label: str) -> str:
+    matches = [(old, new, text.count(old)) for old, new in variants if text.count(old)]
+    total = sum(count for _old, _new, count in matches)
+    if total != 1:
+        raise PatchError(f"{label}: expected one supported structural match, found {total}")
+    old, new, _count = matches[0]
+    return text.replace(old, new, 1)
+
+
 def patched_hub(source: str) -> str:
     source = replace_once(
         source,
@@ -90,23 +99,37 @@ def patched_hub(source: str) -> str:
 """,
         "session construction and upstream reaper",
     )
-    source = replace_once(
-        source,
-        """		httpSC := &httpServerConn{
+    downstream_conn = """		httpSC := &httpServerConn{
 			Instance:       done.New(),
 			Reader:         request.Body,
 			ResponseWriter: writer,
 		}
-		conn := splitConn{
-""",
-        """		httpSC := &httpServerConn{
+"""
+    downstream_conn_with_activity = """		httpSC := &httpServerConn{
 			Instance:       done.New(),
 			Reader:         request.Body,
 			ResponseWriter: writer,
 			onActivity:     xhttpSessionTouch(currentSession),
 		}
+"""
+    downstream_layouts = (
+        # v26.6.27 through v26.7.11 used the listener address directly.
+        """		conn := splitConn{
+""",
+        # v26.7.28 preserves the request's local address when one is present.
+        """		localAddr := h.localAddr
+		if la, ok := request.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && la != nil {
+			localAddr = la
+		}
 		conn := splitConn{
 """,
+    )
+    source = replace_one_variant(
+        source,
+        tuple(
+            (downstream_conn + layout, downstream_conn_with_activity + layout)
+            for layout in downstream_layouts
+        ),
         "downstream activity hook",
     )
     source = replace_once(

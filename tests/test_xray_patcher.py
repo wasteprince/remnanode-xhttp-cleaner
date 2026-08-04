@@ -78,6 +78,34 @@ func (ln *Listener) Close() error {
 """
 
 
+HUB_FIXTURE_26_7_28 = HUB_FIXTURE.replace(
+    """\t\thttpSC := &httpServerConn{
+\t\t\tInstance:       done.New(),
+\t\t\tReader:         request.Body,
+\t\t\tResponseWriter: writer,
+\t\t}
+\t\tconn := splitConn{
+""",
+    """\t\thttpSC := &httpServerConn{
+\t\t\tInstance:       done.New(),
+\t\t\tReader:         request.Body,
+\t\t\tResponseWriter: writer,
+\t\t}
+\t\t_ = currentSession.uploadQueue.Push(Packet{Reader: httpSC})
+\t\thttpSC := &httpServerConn{
+\t\t\tInstance:       done.New(),
+\t\t\tReader:         request.Body,
+\t\t\tResponseWriter: writer,
+\t\t}
+\t\tlocalAddr := h.localAddr
+\t\tif la, ok := request.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && la != nil {
+\t\t\tlocalAddr = la
+\t\t}
+\t\tconn := splitConn{
+""",
+)
+
+
 QUEUE_FIXTURE = """package splithttp
 \tmaxPackets    int
 \tclosed        *done.Instance
@@ -131,6 +159,13 @@ class PatcherTests(unittest.TestCase):
         self.assertIn("var defaultBufferSize atomic.Int32", policy)
         self.assertIn("return 128 * 1024", policy)
         self.assertNotIn("return 512 * 1024", policy)
+
+    def test_v26_7_28_downstream_layout_is_patched_without_touching_stream_up(self):
+        hub = patch_xray.patched_hub(HUB_FIXTURE_26_7_28)
+        stream_up, downstream = hub.split("_ = currentSession.uploadQueue.Push", 1)
+        self.assertNotIn("xhttpSessionTouch(currentSession)", stream_up)
+        self.assertIn("xhttpSessionTouch(currentSession)", downstream)
+        self.assertIn("localAddr := h.localAddr", downstream)
 
     def test_multiple_supported_policy_anchors_fail_closed(self):
         with self.assertRaises(patch_xray.PatchError):
