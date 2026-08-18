@@ -4,6 +4,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +149,26 @@ class WireFormatTests(unittest.TestCase):
             socket.AF_INET, 0, sockid, request_info=False
         )
         self.assertEqual(struct.unpack_from("=II", payload, 48), cookie)
+
+
+class WorkerSafetyTests(unittest.TestCase):
+    def test_apply_waits_30_seconds_and_rechecks_activity(self):
+        original = record(idle_ms=600_000)
+        active = MODULE.dataclasses.replace(original, last_received_ms=1_000)
+        client = mock.MagicMock()
+        client.dump.side_effect = [[original], []]
+        client.query_exact.return_value = active
+        context = mock.MagicMock()
+        context.__enter__.return_value = client
+        context.__exit__.return_value = False
+        config = MODULE.Config(clean_established_outbound=True)
+        with mock.patch.object(MODULE, "DiagClient", return_value=context), mock.patch.object(
+            MODULE, "owned_socket_inodes", side_effect=[{42}, {42}]
+        ), mock.patch.object(MODULE.time, "sleep") as sleep:
+            result = MODULE.worker(123, config, apply=True)
+        sleep.assert_called_once_with(MODULE.ACTIVITY_RECHECK_SECONDS)
+        client.destroy.assert_not_called()
+        self.assertEqual(result["skipped_changed"], 1)
 
 
 class ProcessMetricTests(unittest.TestCase):

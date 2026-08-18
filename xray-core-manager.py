@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-VERSION = "5.0.0"
-PATCH_ID = "xhttp-cleaner-v5"
+VERSION = "6.0.0"
+PATCH_ID = "xhttp-cleaner-v6"
 PATCH_MARKER_RE = re.compile(r"\bxhttp-cleaner-v\d+\b")
 DEFAULT_CONFIG = Path("/etc/remnanode-xhttp-clean.json")
 STATE_ROOT = Path("/var/lib/remnanode-xhttp-clean")
@@ -279,6 +279,7 @@ def clone_and_build(info: dict[str, str], destination: Path) -> None:
              "transport/internet/hysteria/xhttp_cleaner_memory_guard.go",
              "transport/internet/hysteria/xhttp_cleaner_memory_guard_test.go",
              "main/main.go",
+             "main/run.go",
              "main/xhttp_cleaner_memory_optimizer.go",
              "main/xhttp_cleaner_memory_optimizer_test.go"], capture=False, timeout=300)
         run(["docker", "run", "--rm", *mounts, image, "go", "test",

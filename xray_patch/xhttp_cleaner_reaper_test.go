@@ -20,7 +20,7 @@ func testXHTTPSession(lastActivity time.Time) *httpSession {
 func TestXHTTPCleanerKeepsRecentlyActiveSession(t *testing.T) {
 	now := time.Now()
 	handler := &requestHandler{}
-	session := testXHTTPSession(now.Add(-xhttpCleanerIdleTTL + time.Second))
+	session := testXHTTPSession(now.Add(-CleanerIdleTimeout() + time.Second))
 	handler.sessions.Store("session", session)
 	if handler.reapXHTTPSessionIfIdle("session", session, now) {
 		t.Fatal("active session was reaped")
@@ -33,7 +33,7 @@ func TestXHTTPCleanerKeepsRecentlyActiveSession(t *testing.T) {
 func TestXHTTPCleanerReapsExactIdleSession(t *testing.T) {
 	now := time.Now()
 	handler := &requestHandler{}
-	session := testXHTTPSession(now.Add(-xhttpCleanerIdleTTL - time.Second))
+	session := testXHTTPSession(now.Add(-CleanerIdleTimeout() - time.Second))
 	handler.sessions.Store("session", session)
 	if !handler.reapXHTTPSessionIfIdle("session", session, now) {
 		t.Fatal("idle session was not reaped")
@@ -49,7 +49,7 @@ func TestXHTTPCleanerReapsExactIdleSession(t *testing.T) {
 func TestXHTTPCleanerDoesNotDeleteReusedSessionID(t *testing.T) {
 	now := time.Now()
 	handler := &requestHandler{}
-	oldSession := testXHTTPSession(now.Add(-xhttpCleanerIdleTTL - time.Second))
+	oldSession := testXHTTPSession(now.Add(-CleanerIdleTimeout() - time.Second))
 	newSession := testXHTTPSession(now)
 	handler.sessions.Store("same-id", newSession)
 	if handler.reapXHTTPSessionIfIdle("same-id", oldSession, now) {
@@ -57,6 +57,16 @@ func TestXHTTPCleanerDoesNotDeleteReusedSessionID(t *testing.T) {
 	}
 	if got, ok := handler.sessions.Load("same-id"); !ok || got != newSession {
 		t.Fatal("replacement session was deleted")
+	}
+}
+
+func TestXHTTPCleanerAppliesActivityGrace(t *testing.T) {
+	now := time.Now()
+	handler := &requestHandler{}
+	session := testXHTTPSession(now.Add(-xhttpCleanerIdleTTL - xhttpCleanerActivityGrace/2))
+	handler.sessions.Store("grace", session)
+	if handler.reapXHTTPSessionIfIdle("grace", session, now) {
+		t.Fatal("session was reaped during the 30-second activity grace")
 	}
 }
 

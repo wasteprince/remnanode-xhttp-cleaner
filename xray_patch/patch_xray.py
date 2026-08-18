@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_ID = "xhttp-cleaner-v5"
+PATCH_ID = "xhttp-cleaner-v6"
 
 
 class PatchError(RuntimeError):
@@ -374,15 +374,83 @@ def patched_hysteria_hub(source: str) -> str:
         source,
         """\t\t\t\t\tudpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
 """,
-        """\t\t\t\t\t// Bound only inactive logical UDP sessions. The guard preserves
-\t\t\t\t\t// upstream's 60s default and never changes active QUIC traffic.
-\t\t\t\t\tudpIdleTimeout: boundedHysteriaUDPIdleTimeout(time.Duration(h.config.UdpIdleTimeout) * time.Second),
+        """\t\t\t\t\t// Configure only inactive logical UDP sessions. The guard preserves
+\t\t\t\t\t// the parsed timeout by default and never changes active QUIC traffic.
+\t\t\t\t\tudpIdleTimeout: configuredHysteriaUDPIdleTimeoutSeconds(h.config.UdpIdleTimeout),
 """,
         "Hysteria inactive UDP lifetime",
     )
 
 
 def patched_hysteria_conn(source: str) -> str:
+    source = replace_once(
+        source,
+        """func (c *InterConn) Write(p []byte) (int, error) {
+\tif c.closed {
+\t\treturn 0, io.ErrClosedPipe
+\t}
+\tbinary.BigEndian.PutUint32(p, c.id)
+\tif err := c.write(p); err != nil {
+\t\treturn 0, err
+\t}
+\tc.Update()
+\treturn len(p), nil
+}
+""",
+        """func (c *InterConn) Write(p []byte) (int, error) {
+\t// Serialize the final activity update with the cleaner's close decision.
+\t// Holding this small per-session mutex never blocks unrelated sessions.
+\tc.mutex.Lock()
+\tdefer c.mutex.Unlock()
+\tif c.closed {
+\t\treturn 0, io.ErrClosedPipe
+\t}
+\tbinary.BigEndian.PutUint32(p, c.id)
+\tif err := c.write(p); err != nil {
+\t\treturn 0, err
+\t}
+\tc.time = time.Now()
+\treturn len(p), nil
+}
+""",
+        "Hysteria outbound activity and close serialization",
+    )
+    source = replace_once(
+        source,
+        """func (m *udpSessionManager) close(udpConn *InterConn) {
+\tif !udpConn.closed {
+\t\tudpConn.closed = true
+\t\tclose(udpConn.ch)
+\t\tdelete(m.m, udpConn.id)
+\t}
+}
+""",
+        """func (m *udpSessionManager) close(udpConn *InterConn) {
+\tudpConn.mutex.Lock()
+\tdefer udpConn.mutex.Unlock()
+\tm.closeHysteriaUDPSessionLocked(udpConn)
+}
+""",
+        "Hysteria released UDP payload references",
+    )
+    source = replace_once(
+        source,
+        """\tfor range ticker.C {
+\t\tif m.closed {
+\t\t\treturn
+\t\t}
+
+\t\tm.RLock()
+""",
+        """\tfor range ticker.C {
+\t\tm.RLock()
+\t\tif m.closed {
+\t\t\tm.RUnlock()
+\t\t\treturn
+\t\t}
+""",
+        "Hysteria manager close-state synchronization",
+    )
     source = replace_once(
         source,
         """\t\tfor _, udpConn := range m.m {
@@ -409,18 +477,24 @@ def patched_hysteria_conn(source: str) -> str:
 """,
         """\t\tfor _, udpConn := range timeoutConn {
 \t\t\tm.Lock()
-\t\t\t// Activity can arrive after the read-locked scan. Recheck both
-\t\t\t// identity and last activity under the manager write lock so an
-\t\t\t// active or recreated session is never closed as stale.
-\t\t\tcurrent, exists := m.m[udpConn.id]
-\t\t\tif exists && current == udpConn && !udpConn.closed &&
-\t\t\t\thysteriaUDPSessionExpired(udpConn, time.Now(), m.udpIdleTimeout) {
-\t\t\t\tm.close(udpConn)
-\t\t\t}
+\t\t\t// Recheck identity and activity under both manager and session
+\t\t\t// locks. A datagram arriving near the boundary wins over cleanup.
+\t\t\tm.closeHysteriaUDPSessionIfExpired(udpConn, time.Now())
 \t\t\tm.Unlock()
 \t\t}
 """,
         "Hysteria UDP expiry activity recheck",
+    )
+    source = replace_once(
+        source,
+        """\t\tid: m.next,
+\t\tch: make(chan []byte, udpMessageChanSize),
+""",
+        """\t\tid:   m.next,
+\t\tch:   make(chan []byte, udpMessageChanSize),
+\t\ttime: time.Now(),
+""",
+        "Hysteria client UDP initial activity timestamp",
     )
     source = replace_once(
         source,
@@ -460,6 +534,30 @@ def patched_main(source: str) -> str:
     )
 
 
+def patched_run(source: str) -> str:
+    return replace_once(
+        source,
+        """\tserver, err := core.New(c)
+\tif err != nil {
+\t\treturn nil, errors.New("failed to create server").Base(err)
+\t}
+
+\treturn server, nil
+""",
+        """\tserver, err := core.New(c)
+\tif err != nil {
+\t\treturn nil, errors.New("failed to create server").Base(err)
+\t}
+
+\t// Use the exact merged protobuf and effective policy manager. This only
+\t// adjusts memory-maintenance cadence; it never changes connection timers.
+\tobserveMemoryOptimizerConfig(c, server)
+\treturn server, nil
+""",
+        "config-aware memory optimizer observation",
+    )
+
+
 def patch_tree(root: Path, assets: Path) -> None:
     hub = root / "transport/internet/splithttp/hub.go"
     queue = root / "transport/internet/splithttp/upload_queue.go"
@@ -467,6 +565,7 @@ def patch_tree(root: Path, assets: Path) -> None:
     hysteria_hub = root / "transport/internet/hysteria/hub.go"
     hysteria_conn = root / "transport/internet/hysteria/conn.go"
     main = root / "main/main.go"
+    run = root / "main/run.go"
     destinations = {
         assets / "xhttp_cleaner_reaper.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper.go",
         assets / "xhttp_cleaner_reaper_test.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper_test.go",
@@ -475,7 +574,7 @@ def patch_tree(root: Path, assets: Path) -> None:
         assets / "hysteria_memory_guard.go": root / "transport/internet/hysteria/xhttp_cleaner_memory_guard.go",
         assets / "hysteria_memory_guard_test.go": root / "transport/internet/hysteria/xhttp_cleaner_memory_guard_test.go",
     }
-    source_paths = (hub, queue, default_policy, hysteria_hub, hysteria_conn, main)
+    source_paths = (hub, queue, default_policy, hysteria_hub, hysteria_conn, main, run)
     for path in source_paths:
         if not path.is_file():
             raise PatchError(f"required Xray source file is missing: {path}")
@@ -493,6 +592,7 @@ def patch_tree(root: Path, assets: Path) -> None:
         hysteria_hub: patched_hysteria_hub(originals[hysteria_hub]),
         hysteria_conn: patched_hysteria_conn(originals[hysteria_conn]),
         main: patched_main(originals[main]),
+        run: patched_run(originals[run]),
     }
 
     for path in destinations:

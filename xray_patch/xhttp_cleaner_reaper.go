@@ -12,11 +12,19 @@ import (
 const (
 	xhttpCleanerIdleTTL       = 5 * time.Minute
 	xhttpCleanerCheckInterval = 5 * time.Minute
+	xhttpCleanerActivityGrace = 30 * time.Second
 	xhttpCleanerPreconnectTTL = 30 * time.Second
 	// net/http applies IdleTimeout only while waiting for the next request. A
 	// long-running XHTTP stream remains active and is not interrupted by it.
 	xhttpCleanerHTTPIdleTimeout = 5 * time.Minute
 )
+
+// CleanerIdleTimeout is the exact inactivity window observed by the global
+// config-aware memory optimizer. The additional grace protects activity which
+// arrives close to a periodic reaper scan.
+func CleanerIdleTimeout() time.Duration {
+	return xhttpCleanerIdleTTL + xhttpCleanerActivityGrace
+}
 
 type xhttpSessionActivity struct {
 	lastUnixNano atomic.Int64
@@ -62,7 +70,7 @@ func (h *uploadQueue) touchActivity() {
 // the reaper.  CompareAndDelete is the guard against a new session reusing the
 // same public session ID (and, consequently, the same client IP).
 func (h *requestHandler) reapXHTTPSessionIfIdle(sessionID string, session *httpSession, now time.Time) bool {
-	if session == nil || session.activity.idleAt(now) < xhttpCleanerIdleTTL {
+	if session == nil || session.activity.idleAt(now) < CleanerIdleTimeout() {
 		return false
 	}
 	if !h.sessions.CompareAndDelete(sessionID, session) {

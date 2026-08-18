@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))
@@ -55,6 +55,7 @@ STATE_NAMES = {
     TCP_LISTEN: "LISTEN",
 }
 TARGET_STATES = (TCP_ESTABLISHED, TCP_CLOSE_WAIT)
+ACTIVITY_RECHECK_SECONDS = 30
 
 
 class CleanerError(RuntimeError):
@@ -548,6 +549,11 @@ def worker(
         closed: List[Tuple[SocketRecord, str]] = []
         skipped_changed = 0
         if apply:
+            # A socket must remain inactive through a second, independent
+            # 30-second observation window. This is intentionally paid only
+            # when there are candidates and never delays a dry-run/status.
+            if candidates:
+                time.sleep(ACTIVITY_RECHECK_SECONDS)
             # Refresh ownership once after the initial dump. Re-reading tens of
             # thousands of fd symlinks for every candidate would be O(n²).
             # Per-socket tuple reuse is still guarded by query_exact + cookie.
@@ -851,10 +857,20 @@ def command_status(config: Config) -> None:
     print(f"memory_optimizer_runtime_mb={int(memory.get('runtime_in_use_bytes', 0) or 0) // (1024 * 1024)}")
     print(f"memory_optimizer_runs={int(memory.get('forced_runs', 0) or 0)}")
     print(f"memory_optimizer_last_reclaimed_mb={int(memory.get('last_reclaimed_bytes', 0) or 0) // (1024 * 1024)}")
+    print(f"memory_optimizer_adaptive_interval_seconds={int(memory.get('adaptive_interval_seconds', 0) or 0)}")
+    print(f"memory_optimizer_activity_grace_seconds={int(memory.get('activity_grace_seconds', 0) or 0)}")
+    print(f"memory_optimizer_last_trigger={memory.get('last_trigger', '')}")
+    print(f"hysteria_sessions_released={int(memory.get('hysteria_sessions_released', 0) or 0)}")
+    print(f"hysteria_pending_sessions={int(memory.get('hysteria_pending_sessions', 0) or 0)}")
+    print(f"hysteria_queued_mb_released={int(memory.get('hysteria_queued_bytes_released', 0) or 0) // (1024 * 1024)}")
+    print(f"hysteria_reclaim_runs={int(memory.get('hysteria_reclaim_runs', 0) or 0)}")
+    observed = memory.get("observed_idle_timeouts_seconds", {})
+    print(f"memory_optimizer_observed_timeouts={json.dumps(observed, sort_keys=True, separators=(',', ':')) if isinstance(observed, dict) else '{}'}")
     print(f"memory_optimizer_updated_at={memory.get('updated_at', '')}")
     print(f"xhttp_listeners={','.join(result['xhttp_listeners'])}")
     print(f"xhttp_discovery={result['xhttp_discovery']}")
     print(f"idle_seconds={config.idle_seconds}")
+    print(f"activity_recheck_seconds={ACTIVITY_RECHECK_SECONDS}")
     print(f"listening_ports={','.join(map(str, result['listen_ports']))}")
 
 

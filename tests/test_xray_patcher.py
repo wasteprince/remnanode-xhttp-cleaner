@@ -146,6 +146,30 @@ HYSTERIA_HUB_FIXTURE = """package hysteria
 
 
 HYSTERIA_CONN_FIXTURE = """package hysteria
+func (c *InterConn) Write(p []byte) (int, error) {
+\tif c.closed {
+\t\treturn 0, io.ErrClosedPipe
+\t}
+\tbinary.BigEndian.PutUint32(p, c.id)
+\tif err := c.write(p); err != nil {
+\t\treturn 0, err
+\t}
+\tc.Update()
+\treturn len(p), nil
+}
+func (m *udpSessionManager) close(udpConn *InterConn) {
+\tif !udpConn.closed {
+\t\tudpConn.closed = true
+\t\tclose(udpConn.ch)
+\t\tdelete(m.m, udpConn.id)
+\t}
+}
+\tfor range ticker.C {
+\t\tif m.closed {
+\t\t\treturn
+\t\t}
+
+\t\tm.RLock()
 \t\tfor _, udpConn := range m.m {
 \t\t\tif now.Sub(udpConn.Time()) > m.udpIdleTimeout {
 \t\t\t\ttimeoutConn = append(timeoutConn, udpConn)
@@ -156,6 +180,10 @@ HYSTERIA_CONN_FIXTURE = """package hysteria
 \t\t\tm.close(udpConn)
 \t\t\tm.Unlock()
 \t\t}
+\tudpConn := &InterConn{
+\t\tid: m.next,
+\t\tch: make(chan []byte, udpMessageChanSize),
+\t}
 \tudpConn, ok := m.m[id]
 \tif ok {
 \t\tselect {
@@ -167,6 +195,16 @@ func main() {
 \tos.Args = getArgsV4Compatible()
 
 \tbase.RootCommand.Long = "Xray is a platform for building proxies."
+"""
+
+
+RUN_FIXTURE = """package main
+\tserver, err := core.New(c)
+\tif err != nil {
+\t\treturn nil, errors.New("failed to create server").Base(err)
+\t}
+
+\treturn server, nil
 """
 
 
@@ -200,10 +238,13 @@ class PatcherTests(unittest.TestCase):
     def test_hysteria_idle_sessions_are_bounded_and_activity_safe(self):
         hub = patch_xray.patched_hysteria_hub(HYSTERIA_HUB_FIXTURE)
         conn = patch_xray.patched_hysteria_conn(HYSTERIA_CONN_FIXTURE)
-        self.assertIn("boundedHysteriaUDPIdleTimeout", hub)
+        self.assertIn("configuredHysteriaUDPIdleTimeoutSeconds", hub)
         self.assertIn("hysteriaUDPSessionExpired", conn)
-        self.assertIn("current == udpConn", conn)
         self.assertIn("udpConn.Update()", conn)
+        self.assertIn("closeHysteriaUDPSessionLocked", conn)
+        self.assertIn("closeHysteriaUDPSessionIfExpired", conn)
+        self.assertIn("c.mutex.Lock()", conn)
+        self.assertIn("time: time.Now()", conn)
 
     def test_memory_optimizer_starts_only_after_command_normalization(self):
         main = patch_xray.patched_main(MAIN_FIXTURE)
@@ -212,6 +253,10 @@ class PatcherTests(unittest.TestCase):
             main.index("os.Args = getArgsV4Compatible()"),
             main.index("startMemoryOptimizerForCommand(os.Args)"),
         )
+
+    def test_memory_optimizer_observes_exact_merged_config(self):
+        run = patch_xray.patched_run(RUN_FIXTURE)
+        self.assertIn("observeMemoryOptimizerConfig(c, server)", run)
 
     def test_multiple_supported_policy_anchors_fail_closed(self):
         with self.assertRaises(patch_xray.PatchError):
@@ -238,12 +283,14 @@ class PatcherTests(unittest.TestCase):
             hysteria_hub = hysteria_package / "hub.go"
             hysteria_conn = hysteria_package / "conn.go"
             main = main_package / "main.go"
+            run = main_package / "run.go"
             hub.write_text(HUB_FIXTURE, encoding="utf-8")
             queue.write_text("incompatible", encoding="utf-8")
             policy.write_text(POLICY_FIXTURE, encoding="utf-8")
             hysteria_hub.write_text(HYSTERIA_HUB_FIXTURE, encoding="utf-8")
             hysteria_conn.write_text(HYSTERIA_CONN_FIXTURE, encoding="utf-8")
             main.write_text(MAIN_FIXTURE, encoding="utf-8")
+            run.write_text(RUN_FIXTURE, encoding="utf-8")
             before = hub.read_text(encoding="utf-8")
             with self.assertRaises(patch_xray.PatchError):
                 patch_xray.patch_tree(root, ROOT / "xray_patch")
