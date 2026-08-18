@@ -31,3 +31,22 @@ func TestMemoryOptimizerRuntimeInUseCannotUnderflow(t *testing.T) {
 		t.Fatalf("runtimeInUse = %d; want 70", got)
 	}
 }
+
+func TestMemoryOptimizerRunsOnlyForLongLivedServerCommand(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"xray", "run", "-c", "config.json"}, true},
+		{[]string{"xray", "run"}, true},
+		{[]string{"xray", "version"}, false},
+		{[]string{"xray", "run", "-test", "-c", "config.json"}, false},
+		{[]string{"xray", "run", "-dump=true"}, false},
+		{[]string{"xray"}, false},
+	}
+	for _, test := range tests {
+		if got := memoryOptimizerServerCommand(test.args); got != test.want {
+			t.Fatalf("memoryOptimizerServerCommand(%q) = %v; want %v", test.args, got, test.want)
+		}
+	}
+}

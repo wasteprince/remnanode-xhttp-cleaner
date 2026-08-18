@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-VERSION = "4.0.0"
-PATCH_ID = "xhttp-cleaner-v4"
+VERSION = "5.0.0"
+PATCH_ID = "xhttp-cleaner-v5"
 PATCH_MARKER_RE = re.compile(r"\bxhttp-cleaner-v\d+\b")
 DEFAULT_CONFIG = Path("/etc/remnanode-xhttp-clean.json")
 STATE_ROOT = Path("/var/lib/remnanode-xhttp-clean")
@@ -191,6 +191,8 @@ def installed_assets() -> Path:
         assets / "xhttp_cleaner_reaper_test.go",
         assets / "core_memory_optimizer.go",
         assets / "core_memory_optimizer_test.go",
+        assets / "hysteria_memory_guard.go",
+        assets / "hysteria_memory_guard_test.go",
     )
     if not all(path.is_file() for path in required):
         raise CoreManagerError(f"Xray patch assets are incomplete: {assets}")
@@ -272,17 +274,26 @@ def clone_and_build(info: dict[str, str], destination: Path) -> None:
              "transport/internet/splithttp/xhttp_cleaner_reaper.go",
              "transport/internet/splithttp/xhttp_cleaner_reaper_test.go",
              "features/policy/policy.go",
+             "transport/internet/hysteria/hub.go",
+             "transport/internet/hysteria/conn.go",
+             "transport/internet/hysteria/xhttp_cleaner_memory_guard.go",
+             "transport/internet/hysteria/xhttp_cleaner_memory_guard_test.go",
+             "main/main.go",
              "main/xhttp_cleaner_memory_optimizer.go",
              "main/xhttp_cleaner_memory_optimizer_test.go"], capture=False, timeout=300)
         run(["docker", "run", "--rm", *mounts, image, "go", "test",
              "./transport/internet/splithttp"], capture=False, timeout=900)
         run(["docker", "run", "--rm", *mounts, image, "go", "test",
-             "./transport/internet/grpc", "./features/policy", "./main"], capture=False, timeout=900)
+             "./transport/internet/grpc", "./transport/internet/hysteria",
+             "./features/policy", "./main"], capture=False, timeout=900)
         run(["docker", "run", "--rm", *mounts, image, "go", "test", "-race",
              "-run", "^TestXHTTPCleaner", "./transport/internet/splithttp"],
             capture=False, timeout=900)
         run(["docker", "run", "--rm", *mounts, image, "go", "test", "-race",
              "-run", "^TestMemoryOptimizer", "./main"], capture=False, timeout=900)
+        run(["docker", "run", "--rm", *mounts, image, "go", "test", "-race",
+             "-run", "^TestHysteriaCleaner", "./transport/internet/hysteria"],
+            capture=False, timeout=900)
         marker = f"{PATCH_ID}-{info['version']}"
         build_script = (
             f"CGO_ENABLED=0 GOOS=linux GOARCH={info['goarch']} "

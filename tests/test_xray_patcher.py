@@ -140,6 +140,36 @@ func readDefaultBufferSize() int32 {
 """
 
 
+HYSTERIA_HUB_FIXTURE = """package hysteria
+\t\t\t\t\tudpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
+"""
+
+
+HYSTERIA_CONN_FIXTURE = """package hysteria
+\t\tfor _, udpConn := range m.m {
+\t\t\tif now.Sub(udpConn.Time()) > m.udpIdleTimeout {
+\t\t\t\ttimeoutConn = append(timeoutConn, udpConn)
+\t\t\t}
+\t\t}
+\t\tfor _, udpConn := range timeoutConn {
+\t\t\tm.Lock()
+\t\t\tm.close(udpConn)
+\t\t\tm.Unlock()
+\t\t}
+\tudpConn, ok := m.m[id]
+\tif ok {
+\t\tselect {
+"""
+
+
+MAIN_FIXTURE = """package main
+func main() {
+\tos.Args = getArgsV4Compatible()
+
+\tbase.RootCommand.Long = "Xray is a platform for building proxies."
+"""
+
+
 class PatcherTests(unittest.TestCase):
     def test_current_structural_contract_is_patched(self):
         hub = patch_xray.patched_hub(HUB_FIXTURE)
@@ -167,6 +197,22 @@ class PatcherTests(unittest.TestCase):
         self.assertIn("xhttpSessionTouch(currentSession)", downstream)
         self.assertIn("localAddr := h.localAddr", downstream)
 
+    def test_hysteria_idle_sessions_are_bounded_and_activity_safe(self):
+        hub = patch_xray.patched_hysteria_hub(HYSTERIA_HUB_FIXTURE)
+        conn = patch_xray.patched_hysteria_conn(HYSTERIA_CONN_FIXTURE)
+        self.assertIn("boundedHysteriaUDPIdleTimeout", hub)
+        self.assertIn("hysteriaUDPSessionExpired", conn)
+        self.assertIn("current == udpConn", conn)
+        self.assertIn("udpConn.Update()", conn)
+
+    def test_memory_optimizer_starts_only_after_command_normalization(self):
+        main = patch_xray.patched_main(MAIN_FIXTURE)
+        self.assertIn("startMemoryOptimizerForCommand(os.Args)", main)
+        self.assertLess(
+            main.index("os.Args = getArgsV4Compatible()"),
+            main.index("startMemoryOptimizerForCommand(os.Args)"),
+        )
+
     def test_multiple_supported_policy_anchors_fail_closed(self):
         with self.assertRaises(patch_xray.PatchError):
             patch_xray.patched_default_policy(POLICY_FIXTURE + POLICY_FIXTURE_26_7)
@@ -182,12 +228,22 @@ class PatcherTests(unittest.TestCase):
             package.mkdir(parents=True)
             policy_package = root / "features/policy"
             policy_package.mkdir(parents=True)
+            hysteria_package = root / "transport/internet/hysteria"
+            hysteria_package.mkdir(parents=True)
+            main_package = root / "main"
+            main_package.mkdir()
             hub = package / "hub.go"
             queue = package / "upload_queue.go"
             policy = policy_package / "policy.go"
+            hysteria_hub = hysteria_package / "hub.go"
+            hysteria_conn = hysteria_package / "conn.go"
+            main = main_package / "main.go"
             hub.write_text(HUB_FIXTURE, encoding="utf-8")
             queue.write_text("incompatible", encoding="utf-8")
             policy.write_text(POLICY_FIXTURE, encoding="utf-8")
+            hysteria_hub.write_text(HYSTERIA_HUB_FIXTURE, encoding="utf-8")
+            hysteria_conn.write_text(HYSTERIA_CONN_FIXTURE, encoding="utf-8")
+            main.write_text(MAIN_FIXTURE, encoding="utf-8")
             before = hub.read_text(encoding="utf-8")
             with self.assertRaises(patch_xray.PatchError):
                 patch_xray.patch_tree(root, ROOT / "xray_patch")

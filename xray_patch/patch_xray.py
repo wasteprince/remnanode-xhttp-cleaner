@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 
-PATCH_ID = "xhttp-cleaner-v4"
+PATCH_ID = "xhttp-cleaner-v5"
 
 
 class PatchError(RuntimeError):
@@ -369,17 +369,114 @@ def patched_default_policy(source: str) -> str:
     return source.replace(old, new, 1)
 
 
+def patched_hysteria_hub(source: str) -> str:
+    return replace_once(
+        source,
+        """\t\t\t\t\tudpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
+""",
+        """\t\t\t\t\t// Bound only inactive logical UDP sessions. The guard preserves
+\t\t\t\t\t// upstream's 60s default and never changes active QUIC traffic.
+\t\t\t\t\tudpIdleTimeout: boundedHysteriaUDPIdleTimeout(time.Duration(h.config.UdpIdleTimeout) * time.Second),
+""",
+        "Hysteria inactive UDP lifetime",
+    )
+
+
+def patched_hysteria_conn(source: str) -> str:
+    source = replace_once(
+        source,
+        """\t\tfor _, udpConn := range m.m {
+\t\t\tif now.Sub(udpConn.Time()) > m.udpIdleTimeout {
+\t\t\t\ttimeoutConn = append(timeoutConn, udpConn)
+\t\t\t}
+\t\t}
+""",
+        """\t\tfor _, udpConn := range m.m {
+\t\t\tif hysteriaUDPSessionExpired(udpConn, now, m.udpIdleTimeout) {
+\t\t\t\ttimeoutConn = append(timeoutConn, udpConn)
+\t\t\t}
+\t\t}
+""",
+        "Hysteria UDP expiry scan",
+    )
+    source = replace_once(
+        source,
+        """\t\tfor _, udpConn := range timeoutConn {
+\t\t\tm.Lock()
+\t\t\tm.close(udpConn)
+\t\t\tm.Unlock()
+\t\t}
+""",
+        """\t\tfor _, udpConn := range timeoutConn {
+\t\t\tm.Lock()
+\t\t\t// Activity can arrive after the read-locked scan. Recheck both
+\t\t\t// identity and last activity under the manager write lock so an
+\t\t\t// active or recreated session is never closed as stale.
+\t\t\tcurrent, exists := m.m[udpConn.id]
+\t\t\tif exists && current == udpConn && !udpConn.closed &&
+\t\t\t\thysteriaUDPSessionExpired(udpConn, time.Now(), m.udpIdleTimeout) {
+\t\t\t\tm.close(udpConn)
+\t\t\t}
+\t\t\tm.Unlock()
+\t\t}
+""",
+        "Hysteria UDP expiry activity recheck",
+    )
+    source = replace_once(
+        source,
+        """\tudpConn, ok := m.m[id]
+\tif ok {
+\t\tselect {
+""",
+        """\tudpConn, ok := m.m[id]
+\tif ok {
+\t\t// Count arrival immediately. Waiting for the dispatcher to drain the
+\t\t// channel could otherwise make a busy session look inactive.
+\t\tudpConn.Update()
+\t\tselect {
+""",
+        "Hysteria inbound datagram activity accounting",
+    )
+    return source
+
+
+def patched_main(source: str) -> str:
+    return replace_once(
+        source,
+        """func main() {
+\tos.Args = getArgsV4Compatible()
+
+\tbase.RootCommand.Long = "Xray is a platform for building proxies."
+""",
+        """func main() {
+\tos.Args = getArgsV4Compatible()
+\t// Short-lived commands such as `xray version` must not start the memory
+\t// optimizer or overwrite the running server's shared status file.
+\tstartMemoryOptimizerForCommand(os.Args)
+
+\tbase.RootCommand.Long = "Xray is a platform for building proxies."
+""",
+        "long-lived Xray command memory optimizer startup",
+    )
+
+
 def patch_tree(root: Path, assets: Path) -> None:
     hub = root / "transport/internet/splithttp/hub.go"
     queue = root / "transport/internet/splithttp/upload_queue.go"
     default_policy = root / "features/policy/policy.go"
+    hysteria_hub = root / "transport/internet/hysteria/hub.go"
+    hysteria_conn = root / "transport/internet/hysteria/conn.go"
+    main = root / "main/main.go"
     destinations = {
         assets / "xhttp_cleaner_reaper.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper.go",
         assets / "xhttp_cleaner_reaper_test.go": root / "transport/internet/splithttp/xhttp_cleaner_reaper_test.go",
         assets / "core_memory_optimizer.go": root / "main/xhttp_cleaner_memory_optimizer.go",
         assets / "core_memory_optimizer_test.go": root / "main/xhttp_cleaner_memory_optimizer_test.go",
+        assets / "hysteria_memory_guard.go": root / "transport/internet/hysteria/xhttp_cleaner_memory_guard.go",
+        assets / "hysteria_memory_guard_test.go": root / "transport/internet/hysteria/xhttp_cleaner_memory_guard_test.go",
     }
-    for path in (hub, queue, default_policy):
+    source_paths = (hub, queue, default_policy, hysteria_hub, hysteria_conn, main)
+    for path in source_paths:
         if not path.is_file():
             raise PatchError(f"required Xray source file is missing: {path}")
     if any(path.exists() for path in destinations.values()):
@@ -387,12 +484,15 @@ def patch_tree(root: Path, assets: Path) -> None:
 
     originals = {
         path: path.read_text(encoding="utf-8")
-        for path in (hub, queue, default_policy)
+        for path in source_paths
     }
     changes = {
         hub: patched_hub(originals[hub]),
         queue: patched_upload_queue(originals[queue]),
         default_policy: patched_default_policy(originals[default_policy]),
+        hysteria_hub: patched_hysteria_hub(originals[hysteria_hub]),
+        hysteria_conn: patched_hysteria_conn(originals[hysteria_conn]),
+        main: patched_main(originals[main]),
     }
 
     for path in destinations:

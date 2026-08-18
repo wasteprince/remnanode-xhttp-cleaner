@@ -204,12 +204,13 @@ class XhttpConfigTests(unittest.TestCase):
         )
         self.assertEqual(listeners, [])
 
-    def test_counts_xhttp_tcp_and_grpc_in_both_directions(self):
+    def test_counts_xhttp_tcp_grpc_and_hysteria_in_both_directions(self):
         counts = MODULE.parse_transport_counts(
             {
                 "inbounds": [
                     {"streamSettings": {"network": "xhttp"}},
                     {"streamSettings": {"network": "grpc"}},
+                    {"protocol": "hysteria", "streamSettings": {"network": "hysteria"}},
                 ],
                 "outbounds": [
                     {"streamSettings": {"network": "raw"}},
@@ -217,7 +218,7 @@ class XhttpConfigTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual(counts, {"xhttp": 2, "tcp": 1, "grpc": 1})
+        self.assertEqual(counts, {"xhttp": 2, "tcp": 1, "grpc": 1, "hysteria": 1})
 
 
 if __name__ == "__main__":

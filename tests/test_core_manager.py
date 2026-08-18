@@ -16,8 +16,8 @@ SPEC.loader.exec_module(manager)
 
 class CoreManagerTests(unittest.TestCase):
     def test_parse_xray_version_and_marker(self):
-        statement = "Xray 26.6.27 (Xray, Penetrates Everything.) xhttp-cleaner-v4-26.6.27 (go1.26 linux/amd64)"
-        self.assertEqual(manager.parse_version(statement), "26.6.27")
+        statement = "Xray 26.7.28 (Xray, Penetrates Everything.) xhttp-cleaner-v5-26.7.28 (go1.26 linux/amd64)"
+        self.assertEqual(manager.parse_version(statement), "26.7.28")
         self.assertIn(manager.PATCH_ID, statement)
 
     def test_legacy_patch_marker_is_detected_for_safe_upgrade(self):

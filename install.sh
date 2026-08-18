@@ -181,6 +181,8 @@ install_cleaner() {
     install -m 0644 "$XRAY_PATCH_SOURCE/xhttp_cleaner_reaper_test.go" "$XRAY_PATCH_INSTALLED/xhttp_cleaner_reaper_test.go"
     install -m 0644 "$XRAY_PATCH_SOURCE/core_memory_optimizer.go" "$XRAY_PATCH_INSTALLED/core_memory_optimizer.go"
     install -m 0644 "$XRAY_PATCH_SOURCE/core_memory_optimizer_test.go" "$XRAY_PATCH_INSTALLED/core_memory_optimizer_test.go"
+    install -m 0644 "$XRAY_PATCH_SOURCE/hysteria_memory_guard.go" "$XRAY_PATCH_INSTALLED/hysteria_memory_guard.go"
+    install -m 0644 "$XRAY_PATCH_SOURCE/hysteria_memory_guard_test.go" "$XRAY_PATCH_INSTALLED/hysteria_memory_guard_test.go"
     python3 "$CLEANER_SOURCE" install
     install -m 0755 "$MENU_SOURCE" "$MENU_INSTALLED"
 

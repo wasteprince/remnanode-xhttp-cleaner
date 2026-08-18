@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 PROGRAM = "remnanode-xhttp-clean"
 AUTHOR = "Bankaev"
 CONFIG_PATH = Path(os.environ.get("XHTTP_CLEAN_CONFIG", "/etc/remnanode-xhttp-clean.json"))
@@ -669,7 +669,7 @@ def discover_xhttp_listeners(config: Config) -> Tuple[List[XhttpListener], str]:
 
 
 def parse_transport_counts(raw_config: object) -> Dict[str, int]:
-    counts = {"xhttp": 0, "tcp": 0, "grpc": 0}
+    counts = {"xhttp": 0, "tcp": 0, "grpc": 0, "hysteria": 0}
     if not isinstance(raw_config, dict):
         return counts
     for section in ("inbounds", "outbounds"):
@@ -683,7 +683,10 @@ def parse_transport_counts(raw_config: object) -> Dict[str, int]:
             if not isinstance(stream, dict):
                 continue
             network = str(stream.get("network", "")).lower()
-            if network in ("xhttp", "splithttp"):
+            protocol = str(entry.get("protocol", "")).lower()
+            if network == "hysteria" or protocol == "hysteria":
+                counts["hysteria"] += 1
+            elif network in ("xhttp", "splithttp"):
                 counts["xhttp"] += 1
             elif network == "grpc":
                 counts["grpc"] += 1
@@ -709,7 +712,7 @@ def discover_transport_counts(config: Config) -> Tuple[Dict[str, int], str]:
             return parse_transport_counts(json.loads(output[first : last + 1])), "ok"
         except json.JSONDecodeError:
             continue
-    return {"xhttp": 0, "tcp": 0, "grpc": 0}, "unavailable"
+    return {"xhttp": 0, "tcp": 0, "grpc": 0, "hysteria": 0}, "unavailable"
 
 
 def read_memory_optimizer_status(config: Config) -> Dict[str, object]:
@@ -841,6 +844,7 @@ def command_status(config: Config) -> None:
     print(f"transport_xhttp={transports['xhttp']}")
     print(f"transport_tcp={transports['tcp']}")
     print(f"transport_grpc={transports['grpc']}")
+    print(f"transport_hysteria={transports['hysteria']}")
     print(f"transport_discovery={transport_discovery}")
     print(f"memory_optimizer_enabled={str(bool(memory.get('enabled'))).lower()}")
     print(f"memory_optimizer_limit_mb={int(memory.get('go_memory_limit_bytes', 0) or 0) // (1024 * 1024)}")

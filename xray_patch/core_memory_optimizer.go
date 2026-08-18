@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	memoryOptimizerDefaultInterval = 5 * time.Minute
-	memoryOptimizerMinimumInterval = time.Minute
+	memoryOptimizerDefaultInterval  = 5 * time.Minute
+	memoryOptimizerMinimumInterval  = time.Minute
 	memoryOptimizerMinimumFootprint = uint64(256 << 20)
 	memoryOptimizerStatusPath       = "/tmp/xray-memory-optimizer.json"
 )
@@ -34,6 +34,7 @@ type memoryOptimizerConfig struct {
 
 type memoryOptimizerStatus struct {
 	UpdatedAt        string `json:"updated_at"`
+	ProcessID        int    `json:"process_id"`
 	Enabled          bool   `json:"enabled"`
 	IntervalSeconds  int64  `json:"interval_seconds"`
 	LimitSource      string `json:"limit_source"`
@@ -206,7 +207,8 @@ func writeMemoryOptimizerStatus(config memoryOptimizerConfig, before, after runt
 		HeapReleased:     after.HeapReleased,
 		ForcedRuns:       memoryOptimizerRuns.Load(),
 		LastReclaimed:    reclaimed,
-		TransportScope:   "xhttp,tcp,grpc",
+		ProcessID:        os.Getpid(),
+		TransportScope:   "xhttp,tcp,grpc,hysteria",
 		ConnectionPolicy: "never-close-active",
 	}
 	if forced {
@@ -266,6 +268,21 @@ func startMemoryOptimizer() {
 	}()
 }
 
-func init() {
-	startMemoryOptimizer()
+func memoryOptimizerServerCommand(args []string) bool {
+	if len(args) < 2 || args[1] != "run" {
+		return false
+	}
+	for _, argument := range args[2:] {
+		name := strings.SplitN(argument, "=", 2)[0]
+		if name == "-test" || name == "--test" || name == "-dump" || name == "--dump" {
+			return false
+		}
+	}
+	return true
+}
+
+func startMemoryOptimizerForCommand(args []string) {
+	if memoryOptimizerServerCommand(args) {
+		startMemoryOptimizer()
+	}
 }

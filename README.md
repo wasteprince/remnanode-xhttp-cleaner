@@ -8,16 +8,16 @@
 
 # 🧬 RemnaNode XHTTP Cleaner
 
-### Безопасный memory fork для XHTTP, TCP и gRPC
+### Безопасный memory fork для XHTTP, Hysteria, TCP и gRPC
 
-[![Version](https://img.shields.io/badge/version-4.0.0-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
+[![Version](https://img.shields.io/badge/version-5.0.0-f5c542?style=for-the-badge)](https://github.com/wasteprince/remnanode-xhttp-cleaner)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-supported-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](#-требования)
 [![Xray](https://img.shields.io/badge/Xray-version--matched-1686F0?style=for-the-badge)](#-безопасное-обновление-ядра)
 [![License](https://img.shields.io/github/license/wasteprince/remnanode-xhttp-cleaner?style=for-the-badge&color=22c55e)](LICENSE)
 
-**v4.0.0 · by Bankaev**
+**v5.0.0 · by Bankaev**
 
-[Установка](#-установка) · [Архитектура](#-что-изменяет-v400) · [CPU](#-оптимизация-cpu) · [Настройки хоста](#-рекомендации-для-настроек-хоста-remnawave) · [Управление](#-управление) · [Откат](#-откат)
+[Установка](#-установка) · [Архитектура](#-что-изменяет-v500) · [CPU](#-оптимизация-cpu) · [Настройки хоста](#-рекомендации-для-настроек-хоста-remnawave) · [Управление](#-управление) · [Откат](#-откат)
 
 </div>
 
@@ -26,23 +26,26 @@
 > [!IMPORTANT]
 > Установщик собирает форк из **точного upstream-тега текущего Xray**, заменяет бинарник внутри уже существующего контейнера и один раз перезапускает этот же контейнер. Docker Compose, env, mounts, ports, networks и restart policy не переписываются. Перезапуск прерывает текущие соединения, поэтому первую установку лучше выполнять в окно обслуживания.
 
-## Зачем появилась v4
+## Зачем появилась v5
 
 V4 разработана после длительного теста RemnaNode под смешанной нагрузкой XHTTP и межсерверного TCP-моста. При примерно 18 тысячах соединений Xray занимал 2,4–2,9 ГиБ RSS, хотя TCP-память cgroup составляла около 50 МиБ: основной объём находился в Go heap/runtime.
 
-Проверка выявила три практические причины лишней нагрузки: слишком большой стандартный pipe budget, медленный возврат освобождённых страниц ОС и внешний обход всех `ESTABLISHED`. Поэтому v4 ограничивает удержание памяти **внутри Xray**, централизованно выполняет reclaim и по умолчанию не закрывает активные XHTTP/TCP/gRPC-соединения.
+V5 добавляет диагностику Hysteria2. Один Hysteria listener обслуживает QUIC через общий UDP-сокет, но каждая логическая UDP-сессия создаёт dispatcher, outbound-сокет и transport pipes. При `udpIdleTimeout=600` тысячи коротких сессий остаются достижимыми десять минут: kernel socket memory при этом может быть небольшим, а основной объём остаётся в Go heap Xray.
+
+Патч ограничивает только неактивные логические Hysteria UDP-сессии двумя минутами (upstream-default 60 секунд), повторно сверяя активность непосредственно перед закрытием. Активный трафик, QUIC connection, flow-control windows и packet queue не изменяются; при новом пакете штатный Hysteria feed может заново создать уже истёкшую логическую сессию.
 
 > [!NOTE]
 > **Оптимизация TCP и gRPC в первую очередь предназначена для серверных outbound-соединений, используемых как мост между двумя серверами.** Долгоживущий межсерверный поток может временно не передавать данные, поэтому Cleaner защищает такие `ESTABLISHED`-соединения от внешнего закрытия и оптимизирует их память через общую pipe policy и memory optimizer внутри Xray.
 
-## ✨ Что изменяет v4.0.0
+## ✨ Что изменяет v5.0.0
 
 | Механизм | Что происходит | Защита протоколов |
 |---|---|---|
 | XHTTP session reaper | Один reaper на listener проверяет полезную upload/download-активность раз в 5 минут | Сессия закрывается только после ≥300 секунд без payload; используется `CompareAndDelete(sessionID, exactPointer)` |
+| Hysteria UDP guard | Ограничивает только неактивную логическую UDP-сессию максимум двумя минутами | Активность учитывается при получении datagram и повторно проверяется под lock перед закрытием; QUIC и активный поток не прерываются |
 | HTTP keep-alive | `IdleTimeout=5m` освобождает соединение, которое ждёт следующий HTTP request | Активный handler/stream этим timeout не прерывается |
 | Общая pipe policy | Стандартный amd64 budget очереди уменьшается с 512 до 128 КиБ на направление | Формат протокола не меняется; явно заданный пользователем `bufferSize` имеет приоритет |
-| Общий memory optimizer | Работает с памятью XHTTP, raw TCP и gRPC; каждые 5 минут делает двухэтапный GC/reclaim при заметном runtime footprint | Достижимые буферы живых соединений GC удалить не может |
+| Общий memory optimizer | Работает с памятью XHTTP, Hysteria, raw TCP и gRPC; каждые 5 минут делает двухэтапный GC/reclaim при заметном runtime footprint | Достижимые буферы живых соединений GC удалить не может; служебные CLI-команды optimizer не запускают |
 | Cgroup-aware limit | Уважает `GOMEMLIMIT`; иначе ставит мягкий лимит Go до 70% доступного cgroup/host ceiling | Это soft limit, а не OOM-kill и не Docker memory limit |
 | Внешняя очистка | По умолчанию рассматривает только `CLOSE_WAIT`, неактивный ≥5 минут | Любой `ESTABLISHED` outbound, включая долгий TCP-мост, защищён по умолчанию |
 | Защита от reuse | Перед `SOCK_DESTROY` повторно сверяются inode, tuple и 64-битный kernel cookie | Новый сокет с тем же IP/портами не совпадёт с cookie старого |
@@ -58,7 +61,7 @@ V4 разработана после длительного теста RemnaNode
 
 ## ⚙️ Оптимизация CPU
 
-Служебная нагрузка уменьшена за счёт одного reaper на listener, отказа от обхода всех `ESTABLISHED` по умолчанию и общего ограниченного GC-цикла для XHTTP/TCP/gRPC. В панели CPU Xray показан отдельно (`100% = один vCore`).
+Служебная нагрузка уменьшена за счёт одного reaper на listener, отказа от обхода всех `ESTABLISHED` по умолчанию и общего ограниченного GC-цикла для XHTTP/Hysteria/TCP/gRPC. В панели CPU Xray показан отдельно (`100% = один vCore`).
 
 Намеренно **не изменяются**:
 
@@ -66,6 +69,7 @@ V4 разработана после длительного теста RemnaNode
 - gRPC read/write buffer size;
 - Linux `tcp_rmem`, `tcp_wmem`, autotuning, BBR и congestion control;
 - XHTTP framing, padding, packet-up и криптография;
+- Hysteria QUIC windows, congestion control и размер datagram-очереди;
 - timeout живого TCP/gRPC-потока.
 
 Агрессивное уменьшение этих буферов могло бы увеличить число syscalls или снизить скорость длинного TCP-моста. CPU-стоимость множества небольших XHTTP-запросов полностью устранить серверным GC невозможно.
@@ -185,7 +189,7 @@ sudo ./install.sh
 
 Timer запускается через пять минут после загрузки и далее раз в пять минут. `ExecStartPre` проверяет marker и версию ядра.
 
-- Для уже установленного `xhttp-cleaner-v4` той же версии сборка не повторяется; после пересоздания контейнера используется готовый artifact нужной версии и архитектуры.
+- Для уже установленного `xhttp-cleaner-v5` той же версии сборка не повторяется; после пересоздания контейнера используется готовый artifact нужной версии и архитектуры.
 - Для новой версии клонируется точный тег, а patch/tests/race/build gate выполняется заново.
 - При изменении structural anchors patcher останавливается **до первой записи**, а неудачная версия не пересобирается таймером каждые пять минут.
 - При обновлении с v3 сначала восстанавливается сохранённый stock binary, поэтому старый форк не становится «оригиналом».
@@ -245,6 +249,7 @@ Optimizer сначала уважает существующий `GOMEMLIMIT`. �
 | `XRAY_MEMORY_OPTIMIZER_MIN_BYTES` | `max(256MiB, ceiling/16)` |
 | `XRAY_MEMORY_OPTIMIZER_FORCE` | `false`; `true` запускает reclaim каждый tick |
 | `XRAY_MEMORY_OPTIMIZER_STATUS` | `/tmp/xray-memory-optimizer.json` |
+| `XRAY_HYSTERIA_UDP_IDLE_CAP` | `2m`; диапазон `30s..10m`, `off` сохраняет исходный timeout |
 | `XHTTP_CLEANER_KEEP_BUILD_CACHE` | пусто; `true` сохраняет Go build cache на host |
 
 Скрипт не редактирует Compose и не добавляет эти env автоматически.
@@ -274,8 +279,8 @@ bash tests/test_install.sh
 
 Реальная сборка дополнительно выполняет:
 
-- upstream tests для `splithttp`, `grpc`, `policy` и `main`;
-- race tests XHTTP reaper и memory optimizer;
+- upstream tests для `splithttp`, `grpc`, `hysteria`, `policy` и `main`;
+- race tests XHTTP reaper, Hysteria guard и memory optimizer;
 - `gofmt` и статическую `CGO_ENABLED=0` сборку;
 - запуск нового binary в test mode на текущем rendered config;
 - после рестарта — проверку container ID, Docker settings, процесса и build marker.
@@ -296,6 +301,7 @@ bash tests/test_install.sh
 
 - Установка и откат перезапускают контейнер и обрывают текущие соединения.
 - Активный поток никогда не освобождается как «старый», поэтому его рабочая память остаётся.
+- Hysteria guard меняет только effective idle timeout, если конфигурация задаёт больше двух минут; `off` возвращает исходное значение.
 - Явный `bufferSize` в policy может переопределить новый default.
 - Установка поверх неизвестного стороннего форка не выполняется автоматически.
 - `FreeOSMemory` не является обещанием конкретного RSS: результат зависит от live heap и нагрузки.
@@ -316,6 +322,7 @@ xhttp-cleaner uninstall
 - [Xray-core v26.6.27 default policy](https://github.com/XTLS/Xray-core/blob/v26.6.27/features/policy/policy.go)
 - [Xray-core v26.7.11 reloadable default policy](https://github.com/XTLS/Xray-core/blob/v26.7.11/features/policy/policy.go)
 - [Xray-core v26.7.28 XHTTP handler](https://github.com/XTLS/Xray-core/blob/v26.7.28/transport/internet/splithttp/hub.go)
+- [Xray-core v26.7.28 Hysteria session manager](https://github.com/XTLS/Xray-core/blob/v26.7.28/transport/internet/hysteria/conn.go)
 - [Go GC guide: soft memory limit и RSS model](https://go.dev/doc/gc-guide)
 - [Go runtime/debug](https://pkg.go.dev/runtime/debug)
 - [grpc-go server buffer/window options](https://pkg.go.dev/google.golang.org/grpc)
